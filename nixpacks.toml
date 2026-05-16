@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["nodejs_22", "python312", "gcc", "ffmpeg", "yt-dlp"]
+nixPkgs = ["nodejs_22", "python312", "gcc", "ffmpeg"]
 
 [phases.install]
 cmds = ["npm install"]
@@ -9,7 +9,7 @@ cmds = [
   "node build.mjs",
   "python3 -m venv .venv",
   ".venv/bin/pip install --upgrade pip",
-  ".venv/bin/pip install pyrogram tgcrypto py-tgcalls"
+  ".venv/bin/pip install yt-dlp pyrogram tgcrypto py-tgcalls"
 ]
 
 [start]
