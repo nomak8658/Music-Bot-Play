@@ -1,7 +1,7 @@
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "node dist/index.mjs"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
