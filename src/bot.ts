@@ -37,73 +37,26 @@ try {
   logger.info({ bin: YT_DLP_BIN, ver }, "yt-dlp ready");
 } catch (err) { logger.error({ err }, "yt-dlp NOT found"); }
 
-// ── Cookies setup (from env var YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES) ──
+// ── Cookies: write once to disk from env var ──────────────────────────────
 const COOKIE_FILE = join(tmpdir(), "yt_cookies.txt");
 function setupCookies(): string | null {
+  const raw = process.env["YOUTUBE_COOKIES"];
+  const b64 = process.env["YOUTUBE_COOKIES_B64"];
   try {
-    const b64 = process.env["YOUTUBE_COOKIES_B64"];
-    const raw = process.env["YOUTUBE_COOKIES"];
-    if (b64) { writeFileSync(COOKIE_FILE, Buffer.from(b64, "base64").toString()); return COOKIE_FILE; }
-    if (raw) { writeFileSync(COOKIE_FILE, raw); return COOKIE_FILE; }
-  } catch { /* ignore */ }
+    if (raw && raw.trim().length > 10) {
+      writeFileSync(COOKIE_FILE, raw);
+      return COOKIE_FILE;
+    }
+    if (b64 && b64.trim().length > 10) {
+      writeFileSync(COOKIE_FILE, Buffer.from(b64, "base64").toString());
+      return COOKIE_FILE;
+    }
+  } catch (err) { logger.error({ err }, "Failed to write cookies"); }
   return null;
 }
 const COOKIE_PATH = setupCookies();
-if (COOKIE_PATH) logger.info("YouTube cookies loaded");
-
-// ── Invidious public instances (fallback when YouTube blocks) ─────────────
-const INVIDIOUS_INSTANCES = [
-  "https://invidious.nerdvpn.de",
-  "https://inv.nadeko.net",
-  "https://invidious.privacydev.net",
-  "https://invidious.tiekoetter.com",
-  "https://yt.artemislena.eu",
-];
-
-type InvAdaptive = { type: string; url: string; bitrate?: number; encoding?: string };
-
-async function fetchFromInvidious(videoId: string): Promise<{ audioUrl: string; instance: string }> {
-  const errors: string[] = [];
-  for (const inst of INVIDIOUS_INSTANCES) {
-    try {
-      const res = await fetch(`${inst}/api/v1/videos/${videoId}?fields=adaptiveFormats`, {
-        signal: AbortSignal.timeout(10_000),
-        headers: { "User-Agent": "Mozilla/5.0" },
-      });
-      if (!res.ok) { errors.push(`${inst}: HTTP ${res.status}`); continue; }
-      const data = await res.json() as { adaptiveFormats?: InvAdaptive[] };
-      const audioFmts = (data.adaptiveFormats ?? [])
-        .filter(f => f.type?.startsWith("audio/") && f.url)
-        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-      if (!audioFmts.length) { errors.push(`${inst}: no audio formats`); continue; }
-      return { audioUrl: audioFmts[0]!.url, instance: inst };
-    } catch (err) {
-      errors.push(`${inst}: ${(err as Error).message?.slice(0, 60)}`);
-    }
-  }
-  throw new Error(`All Invidious instances failed:\n${errors.join("\n")}`);
-}
-
-async function downloadViaInvidious(videoId: string, outPath: string): Promise<void> {
-  const { audioUrl, instance } = await fetchFromInvidious(videoId);
-  logger.info({ instance, videoId }, "Downloading via Invidious");
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-user_agent", "Mozilla/5.0",
-      "-i", audioUrl,
-      "-vn", "-acodec", "libmp3lame", "-q:a", "2",
-      "-y", outPath,
-    ], { stdio: "pipe" });
-    let stderr = "";
-    ff.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
-    ff.on("close", (code) => {
-      if (code === 0 && existsSync(outPath)) resolve();
-      else reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(-200)}`));
-    });
-    ff.on("error", reject);
-    setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 180_000);
-  });
-}
+if (COOKIE_PATH) logger.info("YouTube cookies loaded ✓");
+else logger.warn("No YouTube cookies — bot may get blocked. Add YOUTUBE_COOKIES env var.");
 
 // ── File-ID cache ─────────────────────────────────────────────────────────
 const CACHE_FILE = join(__dirname, "..", "cache.json");
@@ -121,8 +74,10 @@ async function saveCache() {
   catch (err) { logger.warn({ err }, "Cache save failed"); }
 }
 
-// ── Voice queue ───────────────────────────────────────────────────────────
+// ── Types & queue ─────────────────────────────────────────────────────────
+type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbnail: string };
 type QueueItem = { videoId: string; title: string; uploader: string };
+
 const voiceQueue = new Map<number, QueueItem[]>();
 const nowPlaying = new Map<number, string>();
 const pendingQR = new Map<number, number>();
@@ -138,9 +93,12 @@ async function safeEdit(api: Bot["api"], chatId: number, msgId: number, text: st
   catch { try { await api.sendMessage(chatId, text, { parse_mode: "Markdown" }); } catch { /**/ } }
 }
 
-// ── Search (flat-playlist — no format resolution, no bot check) ───────────
-type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbnail: string };
+// ── Cookie args helper ────────────────────────────────────────────────────
+function cookieArgs(): string[] {
+  return COOKIE_PATH ? ["--cookies", COOKIE_PATH] : [];
+}
 
+// ── Search (flat-playlist — no format resolution needed) ──────────────────
 async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   const args = [
     `ytsearch${limit}:${query}`,
@@ -148,9 +106,8 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
     "--no-check-certificates",
     "--socket-timeout", "20",
     "--no-warnings",
+    ...cookieArgs(),
   ];
-  if (COOKIE_PATH) args.push("--cookies", COOKIE_PATH);
-
   let stdout = "";
   try {
     const r = await execFileAsync(YT_DLP_BIN, args, { timeout: 45_000 });
@@ -158,85 +115,87 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   } catch (err: unknown) {
     const e = err as { stdout?: string; stderr?: string };
     if (e.stdout) stdout = e.stdout;
-    else throw new Error((e.stderr ?? "البحث فشل").slice(0, 400));
+    else throw new Error(((e.stderr ?? "") + "").slice(0, 400) || "البحث فشل");
   }
-
   const playlist = JSON.parse(stdout) as {
-    entries?: Array<{
-      id?: string; title?: string; duration?: number;
-      uploader?: string; channel?: string; thumbnail?: string;
-      thumbnails?: Array<{ url: string }>;
-    }>;
+    entries?: Array<{ id?: string; title?: string; duration?: number; uploader?: string; channel?: string; thumbnail?: string; thumbnails?: Array<{ url: string }>; }>;
   };
-  return (playlist.entries ?? [])
-    .filter(e => e.id)
-    .map(e => ({
-      id: e.id!,
-      title: e.title ?? "Unknown",
-      duration: fmtDuration(e.duration ?? 0),
-      uploader: e.uploader ?? e.channel ?? "Unknown",
-      thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
-    }));
+  return (playlist.entries ?? []).filter(e => e.id).map(e => ({
+    id: e.id!,
+    title: e.title ?? "Unknown",
+    duration: fmtDuration(e.duration ?? 0),
+    uploader: e.uploader ?? e.channel ?? "Unknown",
+    thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
+  }));
 }
 
-// ── Download: yt-dlp first, Invidious fallback ────────────────────────────
+// ── Download audio (YouTube via yt-dlp + cookies) ─────────────────────────
 async function downloadAudio(videoId: string): Promise<string> {
   const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
   if (existsSync(mp3Path)) return mp3Path;
 
-  // ── Attempt 1: yt-dlp ──────────────────────────────────────────────────
   const rawTemplate = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
-  const dlArgs = [
+  const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
     "--format", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
     "-o", rawTemplate,
-    "--no-playlist", "--socket-timeout", "30",
-    "--no-check-certificates", "--no-warnings", "--quiet",
+    "--no-playlist",
+    "--socket-timeout", "30",
+    "--no-check-certificates",
+    "--no-warnings",
+    "--quiet",
+    ...cookieArgs(),
   ];
-  if (COOKIE_PATH) dlArgs.push("--cookies", COOKIE_PATH);
 
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
-
-  let ytdlpOk = false;
   let rawPath: string | undefined;
+
   try {
-    await execFileAsync(YT_DLP_BIN, dlArgs, { timeout: 180_000 });
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 180_000 });
+  } catch (err: unknown) {
+    const e = err as { stderr?: string; message?: string };
+    // Check if file was created despite error exit code
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
       if (existsSync(p)) { rawPath = p; break; }
     }
-    ytdlpOk = !!rawPath;
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    const errText = e.stderr ?? e.message ?? "";
-    // Check if file exists despite error
+    if (!rawPath) {
+      const errText = (e.stderr ?? e.message ?? "فشل التحميل").slice(0, 500);
+      // Give a user-friendly message for cookie issues
+      if (errText.includes("Sign in") || errText.includes("bot")) {
+        throw new Error("YouTube يطلب تسجيل دخول. أضف YOUTUBE_COOKIES في Railway ← Variables");
+      }
+      throw new Error(errText);
+    }
+  }
+
+  if (!rawPath) {
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) { rawPath = p; ytdlpOk = true; break; }
-    }
-    if (!ytdlpOk) {
-      logger.warn({ videoId, err: errText.slice(0, 200) }, "yt-dlp failed, trying Invidious");
+      if (existsSync(p)) { rawPath = p; break; }
     }
   }
+  if (!rawPath) throw new Error("الملف لم يُنشأ، جرّب مرة ثانية");
+  if (rawPath === mp3Path) return mp3Path;
 
-  if (ytdlpOk && rawPath) {
-    // Convert to mp3 if needed
-    if (rawPath === mp3Path) return mp3Path;
-    await new Promise<void>((resolve, reject) => {
-      const ff = spawn("ffmpeg", ["-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path], { stdio: "pipe" });
-      ff.on("close", code => code === 0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
-      ff.on("error", reject);
+  // Convert to mp3 with ffmpeg
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn("ffmpeg", ["-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path], { stdio: "pipe" });
+    let stderr = "";
+    ff.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    ff.on("close", code => {
+      if (code === 0 && existsSync(mp3Path)) resolve();
+      else reject(new Error(`ffmpeg فشل: ${stderr.slice(-150)}`));
     });
-    await unlink(rawPath).catch(() => {});
-    return mp3Path;
-  }
+    ff.on("error", reject);
+    setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 120_000);
+  });
 
-  // ── Attempt 2: Invidious fallback ──────────────────────────────────────
-  await downloadViaInvidious(videoId, mp3Path);
+  await unlink(rawPath).catch(() => {});
   return mp3Path;
 }
 
-// ── Send audio ────────────────────────────────────────────────────────────
+// ── Send audio (cache-aware) ──────────────────────────────────────────────
 async function sendAudio(
   chatId: number,
   video: Pick<VideoResult, "id" | "title" | "uploader" | "duration">,
@@ -255,8 +214,7 @@ async function sendAudio(
 
   let dlMsgId = statusMsgId;
   if (!dlMsgId) {
-    const m = await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n*${video.title}*`, { parse_mode: "Markdown" });
-    dlMsgId = m.message_id;
+    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n*${video.title}*`, { parse_mode: "Markdown" })).message_id;
   } else {
     await safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
   }
@@ -267,19 +225,14 @@ async function sendAudio(
     const sent = await api.sendAudio(
       chatId,
       new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.mp3`),
-      {
-        title: video.title.slice(0, 64),
-        performer: video.uploader.slice(0, 64),
-        caption: `🎵 *${video.title}*\n👤 ${video.uploader} · ⏱ ${video.duration}`,
-        parse_mode: "Markdown",
-      },
+      { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
+        caption: `🎵 *${video.title}*\n👤 ${video.uploader} · ⏱ ${video.duration}`, parse_mode: "Markdown" },
     );
     if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
     await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
   } catch (err) {
     logger.error({ err, videoId: video.id }, "sendAudio failed");
-    const msg = (err as Error).message?.slice(0, 300) ?? "خطأ غير معروف";
-    await safeEdit(api, chatId, dlMsgId!, `❌ فشل التحميل:\n\`${msg}\``);
+    await safeEdit(api, chatId, dlMsgId!, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ غير معروف"}`);
     if (filePath && existsSync(filePath)) await unlink(filePath).catch(() => {});
   }
 }
@@ -297,36 +250,49 @@ async function processVoiceQueue(chatId: number, api: Bot["api"]) {
     if (queue[1]) downloadAudio(queue[1].videoId).catch(() => {});
   } catch (err) {
     logger.error({ err }, "Voice failed");
-    await api.sendMessage(chatId, `❌ فشل: ${item.title}`);
-    queue.shift();
-    processVoiceQueue(chatId, api);
+    await api.sendMessage(chatId, `❌ فشل: ${item.title}\n${(err as Error).message?.slice(0, 200) ?? ""}`);
+    queue.shift(); processVoiceQueue(chatId, api);
   }
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────
+// ── /start ────────────────────────────────────────────────────────────────
 bot.command("start", ctx => ctx.reply(
   "أهلاً! 🎵 *بوت الموسيقى*\n\n" +
   "`يوت [أغنية]` — تحميل وإرسال\n" +
   "`بحث [أغنية]` — بحث واختيار\n" +
-  "`شغل [أغنية]` — تشغيل في مكالمة\n" +
-  "`قائمة` / `التالي` / `وقف` — إدارة الطابور\n\n" +
+  "`شغل [أغنية]` — تشغيل في مكالمة صوتية\n" +
+  "`قائمة` · `التالي` · `وقف`\n\n" +
   "💡 `@البوت اسم_الأغنية` في أي محادثة",
   { parse_mode: "Markdown" },
 ));
 
+// ── /status ───────────────────────────────────────────────────────────────
 bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
+  const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة (أضف YOUTUBE_COOKIES)";
   const vs = voiceManager.isReady()
     ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr")
     : "❌ لم تبدأ";
   await ctx.reply(
-    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n` +
-    `🍪 كوكيز: ${COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة"}\n` +
-    `💾 كاش: ${fileIdCache.size} أغنية\n📞 حساب: ${vs}`,
+    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n🍪 كوكيز: ${cookieStatus}\n💾 كاش: ${fileIdCache.size} أغنية\n📞 حساب: ${vs}`,
     { parse_mode: "Markdown" },
   );
 });
 
+// ── /cookies — instructions ───────────────────────────────────────────────
+bot.command("cookies", ctx => ctx.reply(
+  "🍪 *كيف تضيف كوكيز YouTube:*\n\n" +
+  "1️⃣ افتح Chrome/Edge\n" +
+  "2️⃣ ثبّت إضافة: *Get cookies.txt LOCALLY*\n" +
+  "3️⃣ افتح youtube.com وتأكد أنك مسجّل دخول\n" +
+  "4️⃣ اضغط الإضافة ← Export\n" +
+  "5️⃣ روح Railway → Variables → أضف:\n" +
+  "   `YOUTUBE_COOKIES` = (محتوى الملف)\n\n" +
+  "✅ بعد الإضافة أعد تشغيل البوت من Railway",
+  { parse_mode: "Markdown" },
+));
+
+// ── /qr ───────────────────────────────────────────────────────────────────
 bot.command("qr", async ctx => {
   if (!voiceManager.isReady()) return ctx.reply("⏳ خدمة المكالمات لم تبدأ.");
   const msg = await ctx.reply("🔄 جارٍ إنشاء رمز QR…");
@@ -343,7 +309,7 @@ bot.command("qr", async ctx => {
   if (ctx.from?.id) pendingQR.set(ctx.from.id, ctx.chat.id);
 });
 
-// ── Text commands ─────────────────────────────────────────────────────────
+// ── Text handler ──────────────────────────────────────────────────────────
 bot.on("message:text", async ctx => {
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
@@ -354,11 +320,10 @@ bot.on("message:text", async ctx => {
     const msg = await ctx.reply(`🔍 أبحث: *${query}*…`, { parse_mode: "Markdown" });
     try {
       const results = await searchYouTube(query, 1);
-      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج"); return; }
+      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج، جرّب كلمات أخرى"); return; }
       await sendAudio(chatId, results[0]!, ctx.api, msg.message_id);
     } catch (err) {
-      logger.error({ err }, "يوت error");
-      await safeEdit(ctx.api, chatId, msg.message_id, `❌ خطأ:\n\`${(err as Error).message?.slice(0, 300)}\``);
+      await safeEdit(ctx.api, chatId, msg.message_id, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ"}`);
     }
     return;
   }
@@ -369,7 +334,7 @@ bot.on("message:text", async ctx => {
     const msg = await ctx.reply(`🔍 أبحث: *${query}*…`, { parse_mode: "Markdown" });
     try {
       const results = await searchYouTube(query, 5);
-      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج"); return; }
+      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج، جرّب كلمات أخرى"); return; }
       await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
       const kb = new InlineKeyboard();
       for (const v of results) {
@@ -380,8 +345,7 @@ bot.on("message:text", async ctx => {
       }
       await ctx.reply(`🎵 *نتائج "${query}":*`, { parse_mode: "Markdown", reply_markup: kb });
     } catch (err) {
-      logger.error({ err }, "بحث error");
-      await safeEdit(ctx.api, chatId, msg.message_id, `❌ خطأ:\n\`${(err as Error).message?.slice(0, 300)}\``);
+      await safeEdit(ctx.api, chatId, msg.message_id, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ"}`);
     }
     return;
   }
@@ -406,8 +370,7 @@ bot.on("message:text", async ctx => {
         await ctx.reply(`➕ طابور (#${queue.length}): *${v.title}*`, { parse_mode: "Markdown" });
       }
     } catch (err) {
-      logger.error({ err }, "شغل error");
-      await safeEdit(ctx.api, chatId, msg.message_id, `❌ خطأ:\n\`${(err as Error).message?.slice(0, 300)}\``);
+      await safeEdit(ctx.api, chatId, msg.message_id, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ"}`);
     }
     return;
   }
@@ -418,7 +381,6 @@ bot.on("message:text", async ctx => {
     await ctx.reply("⏹ تم الإيقاف.");
     return;
   }
-
   if (text === "التالي") {
     const queue = voiceQueue.get(chatId) ?? [];
     queue.shift();
@@ -429,7 +391,6 @@ bot.on("message:text", async ctx => {
     } else { nowPlaying.delete(chatId); await ctx.reply("✅ انتهى الطابور."); }
     return;
   }
-
   if (text === "قائمة") {
     const queue = voiceQueue.get(chatId) ?? [];
     const cur = nowPlaying.get(chatId);
@@ -460,10 +421,7 @@ bot.on("inline_query", async ctx => {
       })
     );
     await ctx.answerInlineQuery(answers, { cache_time: 60 });
-  } catch (err) {
-    logger.error({ err }, "inline_query error");
-    await ctx.answerInlineQuery([], { cache_time: 5 });
-  }
+  } catch { await ctx.answerInlineQuery([], { cache_time: 5 }); }
 });
 
 // ── Callback ──────────────────────────────────────────────────────────────
@@ -478,7 +436,7 @@ bot.callbackQuery(/^dl:([^:]+):([^:]+):([^:]+):(.*)$/, async ctx => {
   await sendAudio(chatId, { id: videoId, title, uploader, duration: duration ?? "?:??" }, ctx.api);
 });
 
-// ── QR events ─────────────────────────────────────────────────────────────
+// ── Startup ───────────────────────────────────────────────────────────────
 async function notifyAll(text: string) {
   for (const [uid, cid] of pendingQR.entries()) {
     try { await bot.api.sendMessage(cid, text, { parse_mode: "Markdown" }); } catch { /**/ }
@@ -486,7 +444,6 @@ async function notifyAll(text: string) {
   }
 }
 
-// ── Startup ───────────────────────────────────────────────────────────────
 export async function startBot() {
   await loadCache();
   voiceManager.start();
