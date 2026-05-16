@@ -1,0 +1,7 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node artifacts/api-server/dist/index.mjs"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
