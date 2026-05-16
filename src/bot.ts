@@ -1,8 +1,8 @@
 import { Bot, InlineKeyboard, InputFile, InlineQueryResultBuilder } from "grammy";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { unlink, readFile, writeFile, rename } from "node:fs/promises";
-import { existsSync, createReadStream } from "node:fs";
+import { unlink, readFile, writeFile } from "node:fs/promises";
+import { existsSync, createReadStream, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,11 +17,10 @@ if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
 const bot = new Bot(BOT_TOKEN);
 
-// ── yt-dlp binary detection ───────────────────────────────────────────────
+// ── yt-dlp detection ──────────────────────────────────────────────────────
 function findYtDlp(): string {
   const candidates = [
-    "/usr/local/bin/yt-dlp",
-    "/usr/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp",
     "/root/.local/bin/yt-dlp",
     join(__dirname, "..", ".venv", "bin", "yt-dlp"),
     "yt-dlp",
@@ -31,13 +30,80 @@ function findYtDlp(): string {
   }
   throw new Error("yt-dlp not found");
 }
-
 let YT_DLP_BIN = "yt-dlp";
 try {
   YT_DLP_BIN = findYtDlp();
   const ver = execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim();
   logger.info({ bin: YT_DLP_BIN, ver }, "yt-dlp ready");
 } catch (err) { logger.error({ err }, "yt-dlp NOT found"); }
+
+// ── Cookies setup (from env var YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES) ──
+const COOKIE_FILE = join(tmpdir(), "yt_cookies.txt");
+function setupCookies(): string | null {
+  try {
+    const b64 = process.env["YOUTUBE_COOKIES_B64"];
+    const raw = process.env["YOUTUBE_COOKIES"];
+    if (b64) { writeFileSync(COOKIE_FILE, Buffer.from(b64, "base64").toString()); return COOKIE_FILE; }
+    if (raw) { writeFileSync(COOKIE_FILE, raw); return COOKIE_FILE; }
+  } catch { /* ignore */ }
+  return null;
+}
+const COOKIE_PATH = setupCookies();
+if (COOKIE_PATH) logger.info("YouTube cookies loaded");
+
+// ── Invidious public instances (fallback when YouTube blocks) ─────────────
+const INVIDIOUS_INSTANCES = [
+  "https://invidious.nerdvpn.de",
+  "https://inv.nadeko.net",
+  "https://invidious.privacydev.net",
+  "https://invidious.tiekoetter.com",
+  "https://yt.artemislena.eu",
+];
+
+type InvAdaptive = { type: string; url: string; bitrate?: number; encoding?: string };
+
+async function fetchFromInvidious(videoId: string): Promise<{ audioUrl: string; instance: string }> {
+  const errors: string[] = [];
+  for (const inst of INVIDIOUS_INSTANCES) {
+    try {
+      const res = await fetch(`${inst}/api/v1/videos/${videoId}?fields=adaptiveFormats`, {
+        signal: AbortSignal.timeout(10_000),
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (!res.ok) { errors.push(`${inst}: HTTP ${res.status}`); continue; }
+      const data = await res.json() as { adaptiveFormats?: InvAdaptive[] };
+      const audioFmts = (data.adaptiveFormats ?? [])
+        .filter(f => f.type?.startsWith("audio/") && f.url)
+        .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+      if (!audioFmts.length) { errors.push(`${inst}: no audio formats`); continue; }
+      return { audioUrl: audioFmts[0]!.url, instance: inst };
+    } catch (err) {
+      errors.push(`${inst}: ${(err as Error).message?.slice(0, 60)}`);
+    }
+  }
+  throw new Error(`All Invidious instances failed:\n${errors.join("\n")}`);
+}
+
+async function downloadViaInvidious(videoId: string, outPath: string): Promise<void> {
+  const { audioUrl, instance } = await fetchFromInvidious(videoId);
+  logger.info({ instance, videoId }, "Downloading via Invidious");
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-user_agent", "Mozilla/5.0",
+      "-i", audioUrl,
+      "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+      "-y", outPath,
+    ], { stdio: "pipe" });
+    let stderr = "";
+    ff.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    ff.on("close", (code) => {
+      if (code === 0 && existsSync(outPath)) resolve();
+      else reject(new Error(`ffmpeg failed (code ${code}): ${stderr.slice(-200)}`));
+    });
+    ff.on("error", reject);
+    setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 180_000);
+  });
+}
 
 // ── File-ID cache ─────────────────────────────────────────────────────────
 const CACHE_FILE = join(__dirname, "..", "cache.json");
@@ -61,7 +127,6 @@ const voiceQueue = new Map<number, QueueItem[]>();
 const nowPlaying = new Map<number, string>();
 const pendingQR = new Map<number, number>();
 
-// ── Utilities ─────────────────────────────────────────────────────────────
 function fmtDuration(sec: number): string {
   if (!sec || isNaN(sec)) return "?:??";
   const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
@@ -70,23 +135,21 @@ function fmtDuration(sec: number): string {
 
 async function safeEdit(api: Bot["api"], chatId: number, msgId: number, text: string) {
   try { await api.editMessageText(chatId, msgId, text, { parse_mode: "Markdown" }); }
-  catch { try { await api.sendMessage(chatId, text, { parse_mode: "Markdown" }); } catch { /* ignore */ } }
+  catch { try { await api.sendMessage(chatId, text, { parse_mode: "Markdown" }); } catch { /**/ } }
 }
 
-// ── SEARCH — uses --flat-playlist (NO format resolution, NO signature needed) ──
+// ── Search (flat-playlist — no format resolution, no bot check) ───────────
 type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbnail: string };
 
 async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
-  // -J with --flat-playlist gives a single JSON with entries[]
-  // No format resolution = no PO token, no signature issues
   const args = [
     `ytsearch${limit}:${query}`,
-    "-J",
-    "--flat-playlist",
+    "-J", "--flat-playlist",
     "--no-check-certificates",
     "--socket-timeout", "20",
     "--no-warnings",
   ];
+  if (COOKIE_PATH) args.push("--cookies", COOKIE_PATH);
 
   let stdout = "";
   try {
@@ -95,109 +158,85 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   } catch (err: unknown) {
     const e = err as { stdout?: string; stderr?: string };
     if (e.stdout) stdout = e.stdout;
-    else throw new Error((e.stderr ?? "yt-dlp search failed").slice(0, 400));
+    else throw new Error((e.stderr ?? "البحث فشل").slice(0, 400));
   }
 
-  try {
-    const playlist = JSON.parse(stdout) as {
-      entries?: Array<{
-        id?: string; title?: string; duration?: number;
-        uploader?: string; channel?: string; thumbnails?: Array<{ url: string }>;
-        thumbnail?: string; url?: string;
-      }>;
-    };
-    return (playlist.entries ?? [])
-      .filter(e => e.id || e.url)
-      .map(e => ({
-        id: e.id ?? (e.url ?? "").replace("https://www.youtube.com/watch?v=", ""),
-        title: e.title ?? "Unknown",
-        duration: fmtDuration(e.duration ?? 0),
-        uploader: e.uploader ?? e.channel ?? "Unknown",
-        thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
-      }))
-      .filter(v => v.id);
-  } catch {
-    throw new Error("فشل في قراءة نتائج البحث");
-  }
+  const playlist = JSON.parse(stdout) as {
+    entries?: Array<{
+      id?: string; title?: string; duration?: number;
+      uploader?: string; channel?: string; thumbnail?: string;
+      thumbnails?: Array<{ url: string }>;
+    }>;
+  };
+  return (playlist.entries ?? [])
+    .filter(e => e.id)
+    .map(e => ({
+      id: e.id!,
+      title: e.title ?? "Unknown",
+      duration: fmtDuration(e.duration ?? 0),
+      uploader: e.uploader ?? e.channel ?? "Unknown",
+      thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
+    }));
 }
 
-// ── DOWNLOAD — no extractor-args, bestaudio, convert with ffmpeg ──────────
+// ── Download: yt-dlp first, Invidious fallback ────────────────────────────
 async function downloadAudio(videoId: string): Promise<string> {
   const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
   if (existsSync(mp3Path)) return mp3Path;
 
-  const rawOut = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
-
-  // Step 1: download best audio (no extractor-args = yt-dlp picks best client)
+  // ── Attempt 1: yt-dlp ──────────────────────────────────────────────────
+  const rawTemplate = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const dlArgs = [
     `https://www.youtube.com/watch?v=${videoId}`,
     "--format", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-    "-o", rawOut,
-    "--no-playlist",
-    "--socket-timeout", "30",
-    "--no-check-certificates",
-    "--no-warnings",
-    "--quiet",
+    "-o", rawTemplate,
+    "--no-playlist", "--socket-timeout", "30",
+    "--no-check-certificates", "--no-warnings", "--quiet",
   ];
+  if (COOKIE_PATH) dlArgs.push("--cookies", COOKIE_PATH);
 
-  // Try with cookies env var if set
-  if (process.env["YOUTUBE_COOKIES_B64"]) {
-    const cookiePath = join(tmpdir(), "yt_cookies.txt");
-    if (!existsSync(cookiePath)) {
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(cookiePath, Buffer.from(process.env["YOUTUBE_COOKIES_B64"], "base64").toString());
-    }
-    dlArgs.push("--cookies", cookiePath);
-  }
+  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
 
-  let downloadedPath: string | undefined;
+  let ytdlpOk = false;
+  let rawPath: string | undefined;
   try {
-    const r = await execFileAsync(YT_DLP_BIN, dlArgs, { timeout: 180_000 });
-    // Find downloaded file
-    const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
+    await execFileAsync(YT_DLP_BIN, dlArgs, { timeout: 180_000 });
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) { downloadedPath = p; break; }
+      if (existsSync(p)) { rawPath = p; break; }
     }
-    if (!downloadedPath && r.stdout) {
-      // Parse from stdout
-      const match = r.stdout.match(/\[download\] Destination: (.+)/);
-      if (match?.[1] && existsSync(match[1])) downloadedPath = match[1];
-    }
+    ytdlpOk = !!rawPath;
   } catch (err: unknown) {
     const e = err as { stderr?: string; message?: string };
-    // Check if file was created despite error
-    const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
+    const errText = e.stderr ?? e.message ?? "";
+    // Check if file exists despite error
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) { downloadedPath = p; break; }
+      if (existsSync(p)) { rawPath = p; ytdlpOk = true; break; }
     }
-    if (!downloadedPath) throw new Error((e.stderr ?? e.message ?? "فشل التحميل").slice(0, 400));
+    if (!ytdlpOk) {
+      logger.warn({ videoId, err: errText.slice(0, 200) }, "yt-dlp failed, trying Invidious");
+    }
   }
 
-  if (!downloadedPath) throw new Error("ملف الصوت لم يُنشأ");
-  if (downloadedPath === mp3Path) return mp3Path;
-
-  // Step 2: convert to mp3 with ffmpeg
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-i", downloadedPath!,
-      "-vn", "-acodec", "libmp3lame", "-q:a", "2",
-      "-y", mp3Path,
-    ], { stdio: "pipe" });
-    ff.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with code ${code}`));
+  if (ytdlpOk && rawPath) {
+    // Convert to mp3 if needed
+    if (rawPath === mp3Path) return mp3Path;
+    await new Promise<void>((resolve, reject) => {
+      const ff = spawn("ffmpeg", ["-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path], { stdio: "pipe" });
+      ff.on("close", code => code === 0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
+      ff.on("error", reject);
     });
-    ff.on("error", reject);
-  });
+    await unlink(rawPath).catch(() => {});
+    return mp3Path;
+  }
 
-  // Remove raw file
-  await unlink(downloadedPath).catch(() => {});
+  // ── Attempt 2: Invidious fallback ──────────────────────────────────────
+  await downloadViaInvidious(videoId, mp3Path);
   return mp3Path;
 }
 
-// ── Send audio (cache-aware) ──────────────────────────────────────────────
+// ── Send audio ────────────────────────────────────────────────────────────
 async function sendAudio(
   chatId: number,
   video: Pick<VideoResult, "id" | "title" | "uploader" | "duration">,
@@ -214,11 +253,13 @@ async function sendAudio(
     return;
   }
 
-  const dlMsgId = statusMsgId ?? (
-    await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n*${video.title}*`, { parse_mode: "Markdown" })
-  ).message_id;
-
-  if (statusMsgId) await safeEdit(api, chatId, statusMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
+  let dlMsgId = statusMsgId;
+  if (!dlMsgId) {
+    const m = await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n*${video.title}*`, { parse_mode: "Markdown" });
+    dlMsgId = m.message_id;
+  } else {
+    await safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
+  }
 
   let filePath: string | undefined;
   try {
@@ -234,11 +275,11 @@ async function sendAudio(
       },
     );
     if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
-    await api.deleteMessage(chatId, dlMsgId).catch(() => {});
+    await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
   } catch (err) {
     logger.error({ err, videoId: video.id }, "sendAudio failed");
-    const msg = (err as Error).message?.replace(/WARNING:.*\n?/g, "").trim().slice(0, 300) ?? "خطأ";
-    await safeEdit(api, chatId, dlMsgId, `❌ فشل التحميل:\n\`${msg}\``);
+    const msg = (err as Error).message?.slice(0, 300) ?? "خطأ غير معروف";
+    await safeEdit(api, chatId, dlMsgId!, `❌ فشل التحميل:\n\`${msg}\``);
     if (filePath && existsSync(filePath)) await unlink(filePath).catch(() => {});
   }
 }
@@ -249,46 +290,49 @@ async function processVoiceQueue(chatId: number, api: Bot["api"]) {
   if (!queue?.length) { voiceQueue.delete(chatId); nowPlaying.delete(chatId); return; }
   const item = queue[0]!;
   try {
-    const filePath = await downloadAudio(item.videoId);
-    const result = await voiceManager.joinAndPlay(chatId, filePath);
-    if (!result.ok) throw new Error((result.error as string) ?? "فشل التشغيل");
+    const fp = await downloadAudio(item.videoId);
+    const r = await voiceManager.joinAndPlay(chatId, fp);
+    if (!r.ok) throw new Error(String(r.error ?? "فشل"));
     nowPlaying.set(chatId, item.title);
     if (queue[1]) downloadAudio(queue[1].videoId).catch(() => {});
   } catch (err) {
-    logger.error({ err }, "Voice play failed");
-    await api.sendMessage(chatId, `❌ فشل تشغيل: ${item.title}`, { parse_mode: "Markdown" });
+    logger.error({ err }, "Voice failed");
+    await api.sendMessage(chatId, `❌ فشل: ${item.title}`);
     queue.shift();
     processVoiceQueue(chatId, api);
   }
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────
-bot.command("start", (ctx) =>
-  ctx.reply(
-    "أهلاً! 🎵 *بوت الموسيقى*\n\n" +
-    "`يوت [أغنية]` — تحميل وإرسال\n" +
-    "`بحث [أغنية]` — بحث واختيار من القائمة\n" +
-    "`شغل [أغنية]` — تشغيل في مكالمة صوتية\n" +
-    "`قائمة` / `التالي` / `وقف` — إدارة الطابور\n\n" +
-    "💡 أو اكتب `@البوت اسم_الأغنية` في أي محادثة",
-    { parse_mode: "Markdown" },
-  )
-);
+bot.command("start", ctx => ctx.reply(
+  "أهلاً! 🎵 *بوت الموسيقى*\n\n" +
+  "`يوت [أغنية]` — تحميل وإرسال\n" +
+  "`بحث [أغنية]` — بحث واختيار\n" +
+  "`شغل [أغنية]` — تشغيل في مكالمة\n" +
+  "`قائمة` / `التالي` / `وقف` — إدارة الطابور\n\n" +
+  "💡 `@البوت اسم_الأغنية` في أي محادثة",
+  { parse_mode: "Markdown" },
+));
 
-bot.command("status", async (ctx) => {
-  const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "غير موجود ❌"; } })();
-  const voiceStatus = voiceManager.isReady()
-    ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)} (${String(r.phone)})` : "❌ لا يوجد حساب — /qr")
-    : "❌ الخدمة لم تبدأ";
-  await ctx.reply(`*الحالة:*\nyt-dlp: \`${ytVer}\`\n💾 كاش: ${fileIdCache.size} أغنية\n📞 حساب: ${voiceStatus}`, { parse_mode: "Markdown" });
+bot.command("status", async ctx => {
+  const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
+  const vs = voiceManager.isReady()
+    ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr")
+    : "❌ لم تبدأ";
+  await ctx.reply(
+    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n` +
+    `🍪 كوكيز: ${COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة"}\n` +
+    `💾 كاش: ${fileIdCache.size} أغنية\n📞 حساب: ${vs}`,
+    { parse_mode: "Markdown" },
+  );
 });
 
-bot.command("qr", async (ctx) => {
-  if (!voiceManager.isReady()) return ctx.reply("⏳ خدمة المكالمات لم تبدأ بعد.");
+bot.command("qr", async ctx => {
+  if (!voiceManager.isReady()) return ctx.reply("⏳ خدمة المكالمات لم تبدأ.");
   const msg = await ctx.reply("🔄 جارٍ إنشاء رمز QR…");
-  const result = await voiceManager.qrLogin();
-  if (!result.ok || !result.url) { await safeEdit(ctx.api, ctx.chat.id, msg.message_id, `❌ ${String(result.error ?? "فشل")}`); return; }
-  const qrUrl = result.url as string;
+  const r = await voiceManager.qrLogin();
+  if (!r.ok || !r.url) { await safeEdit(ctx.api, ctx.chat.id, msg.message_id, `❌ ${String(r.error ?? "فشل")}`); return; }
+  const qrUrl = r.url as string;
   await ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
   try {
     await ctx.replyWithPhoto(
@@ -299,8 +343,8 @@ bot.command("qr", async (ctx) => {
   if (ctx.from?.id) pendingQR.set(ctx.from.id, ctx.chat.id);
 });
 
-// ── Text handler ──────────────────────────────────────────────────────────
-bot.on("message:text", async (ctx) => {
+// ── Text commands ─────────────────────────────────────────────────────────
+bot.on("message:text", async ctx => {
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
 
@@ -310,7 +354,7 @@ bot.on("message:text", async (ctx) => {
     const msg = await ctx.reply(`🔍 أبحث: *${query}*…`, { parse_mode: "Markdown" });
     try {
       const results = await searchYouTube(query, 1);
-      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج — جرّب كلمات مختلفة"); return; }
+      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج"); return; }
       await sendAudio(chatId, results[0]!, ctx.api, msg.message_id);
     } catch (err) {
       logger.error({ err }, "يوت error");
@@ -325,13 +369,13 @@ bot.on("message:text", async (ctx) => {
     const msg = await ctx.reply(`🔍 أبحث: *${query}*…`, { parse_mode: "Markdown" });
     try {
       const results = await searchYouTube(query, 5);
-      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج — جرّب كلمات مختلفة"); return; }
+      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج"); return; }
       await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
       const kb = new InlineKeyboard();
       for (const v of results) {
-        const prefix = fileIdCache.has(v.id) ? "⚡" : "🎵";
-        kb.text(`${prefix} ${v.title.slice(0, 35)} [${v.duration}]`,
-          `dl:${v.id}:${Buffer.from(v.uploader).toString("base64url").slice(0, 20)}:${Buffer.from(v.title).toString("base64url").slice(0, 40)}:${v.duration}`
+        kb.text(
+          `${fileIdCache.has(v.id) ? "⚡" : "🎵"} ${v.title.slice(0, 35)} [${v.duration}]`,
+          `dl:${v.id}:${Buffer.from(v.uploader).toString("base64url").slice(0, 20)}:${Buffer.from(v.title).toString("base64url").slice(0, 40)}:${v.duration}`,
         ).row();
       }
       await ctx.reply(`🎵 *نتائج "${query}":*`, { parse_mode: "Markdown", reply_markup: kb });
@@ -349,7 +393,7 @@ bot.on("message:text", async (ctx) => {
     const msg = await ctx.reply(`🔍 أبحث: *${query}*…`, { parse_mode: "Markdown" });
     try {
       const results = await searchYouTube(query, 1);
-      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج."); return; }
+      if (!results.length) { await safeEdit(ctx.api, chatId, msg.message_id, "❌ ما لقيت نتائج"); return; }
       await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
       const v = results[0]!;
       const queue = voiceQueue.get(chatId) ?? [];
@@ -370,9 +414,8 @@ bot.on("message:text", async (ctx) => {
 
   if (text === "وقف") {
     voiceQueue.delete(chatId); nowPlaying.delete(chatId);
-    if (!voiceManager.isReady()) return ctx.reply("⏹ تم تفريغ الطابور.");
-    const r = await voiceManager.stop(chatId);
-    await ctx.reply(r.ok ? "⏹ تم الإيقاف وتفريغ الطابور." : `❌ ${String(r.error)}`);
+    if (voiceManager.isReady()) await voiceManager.stop(chatId);
+    await ctx.reply("⏹ تم الإيقاف.");
     return;
   }
 
@@ -389,18 +432,18 @@ bot.on("message:text", async (ctx) => {
 
   if (text === "قائمة") {
     const queue = voiceQueue.get(chatId) ?? [];
-    const current = nowPlaying.get(chatId);
-    if (!queue.length && !current) return ctx.reply("📋 الطابور فارغ.");
+    const cur = nowPlaying.get(chatId);
+    if (!queue.length && !cur) return ctx.reply("📋 الطابور فارغ.");
     let m = "📋 *الطابور:*\n";
-    if (current) m += `▶️ *${current}*\n`;
+    if (cur) m += `▶️ *${cur}*\n`;
     queue.forEach((t, i) => { m += `${i + 1}. ${t.title}\n`; });
     await ctx.reply(m, { parse_mode: "Markdown" });
     return;
   }
 });
 
-// ── Inline mode ───────────────────────────────────────────────────────────
-bot.on("inline_query", async (ctx) => {
+// ── Inline ────────────────────────────────────────────────────────────────
+bot.on("inline_query", async ctx => {
   const query = ctx.inlineQuery.query.trim();
   if (query.length < 2) return ctx.answerInlineQuery([], { cache_time: 1 });
   try {
@@ -424,7 +467,7 @@ bot.on("inline_query", async (ctx) => {
 });
 
 // ── Callback ──────────────────────────────────────────────────────────────
-bot.callbackQuery(/^dl:([^:]+):([^:]+):([^:]+):(.*)$/, async (ctx) => {
+bot.callbackQuery(/^dl:([^:]+):([^:]+):([^:]+):(.*)$/, async ctx => {
   const [, videoId, uploaderB64, titleB64, duration] = ctx.match;
   if (!videoId || !titleB64 || !uploaderB64) return ctx.answerCallbackQuery({ text: "❌ بيانات ناقصة" });
   const title = Buffer.from(titleB64, "base64url").toString();
@@ -435,6 +478,14 @@ bot.callbackQuery(/^dl:([^:]+):([^:]+):([^:]+):(.*)$/, async (ctx) => {
   await sendAudio(chatId, { id: videoId, title, uploader, duration: duration ?? "?:??" }, ctx.api);
 });
 
+// ── QR events ─────────────────────────────────────────────────────────────
+async function notifyAll(text: string) {
+  for (const [uid, cid] of pendingQR.entries()) {
+    try { await bot.api.sendMessage(cid, text, { parse_mode: "Markdown" }); } catch { /**/ }
+    pendingQR.delete(uid);
+  }
+}
+
 // ── Startup ───────────────────────────────────────────────────────────────
 export async function startBot() {
   await loadCache();
@@ -442,15 +493,9 @@ export async function startBot() {
   voiceManager.once("ready", async () => {
     logger.info("VoiceService ready");
     const s = await voiceManager.checkSession();
-    logger.info(s.ok ? { name: s.name } : {}, s.ok ? "User session active" : "No user session — use /qr");
+    logger.info(s.ok ? { name: s.name } : {}, s.ok ? "Session active" : "No session — use /qr");
   });
   voiceManager.on("message", async (msg: Record<string, unknown>) => {
-    const notifyAll = async (text: string) => {
-      for (const [uid, cid] of pendingQR.entries()) {
-        try { await bot.api.sendMessage(cid, text, { parse_mode: "Markdown" }); } catch { /* ignore */ }
-        pendingQR.delete(uid);
-      }
-    };
     if (msg["event"] === "qr_logged_in") {
       let txt = `✅ تم تسجيل الدخول!\n👤 ${String(msg["name"])} (${String(msg["phone"])})`;
       if (msg["session_string"]) txt += `\n\n💾 *Session String:*\n\`${String(msg["session_string"])}\`\n\nضعه في \`TELEGRAM_SESSION_STRING\``;
