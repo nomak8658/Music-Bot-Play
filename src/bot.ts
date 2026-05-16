@@ -137,53 +137,41 @@ async function downloadAudio(videoId: string): Promise<string> {
   const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
-  const common = [
-    "--no-playlist", "--socket-timeout", "30",
-    "--no-check-certificates", "--no-warnings",
+  // Absolute minimal command — no format filter, no extractor-args, just cookies
+  // Capture FULL stderr so we know the real error
+  const args = [
+    `https://www.youtube.com/watch?v=${videoId}`,
+    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+    "-o", outTpl,
+    "--no-playlist",
+    "--socket-timeout", "30",
+    "--no-check-certificates",
     ...cookieArgs(),
+    // NO --quiet, NO --no-warnings — we need the real error
   ];
 
-  // Try multiple URL strategies — YouTube Music is less restricted than YouTube
-  const attempts = [
-    // 1. YouTube Music URL (different CDN, less bot-blocking)
-    [`https://music.youtube.com/watch?v=${videoId}`, ["-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", outTpl, ...common]],
-    // 2. YouTube with no format filter (let yt-dlp pick anything)
-    [`https://www.youtube.com/watch?v=${videoId}`,   ["-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", outTpl, ...common]],
-    // 3. YouTube with explicit bestaudio (no ext filter)
-    [`https://www.youtube.com/watch?v=${videoId}`,   ["--format", "bestaudio/best", "-o", outTpl, ...common]],
-  ] as [string, string[]][];
-
   let rawPath: string | undefined;
-  let lastErr = "";
+  let fullStderr = "";
 
-  for (const [ytUrl, args] of attempts) {
-    // Clean up any partial files before retry
-    for (const ext of exts) {
-      const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) { try { (await import("node:fs")).unlinkSync(p); } catch {/**/ } }
-    }
+  try {
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 180_000 });
+  } catch (err: unknown) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    fullStderr = (e.stderr ?? e.message ?? "").trim();
+    logger.error({ videoId, stderr: fullStderr }, "yt-dlp failed");
+  }
 
-    try {
-      await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 180_000 });
-    } catch (err: unknown) {
-      lastErr = ((err as { stderr?: string }).stderr ?? (err as Error).message ?? "").slice(0, 600);
+  for (const ext of exts) {
+    const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
+    if (existsSync(p)) {
+      const { statSync } = await import("node:fs");
+      if (statSync(p).size > 1000) { rawPath = p; break; }
     }
-    for (const ext of exts) {
-      const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) {
-        const { statSync } = await import("node:fs");
-        if (statSync(p).size > 1000) { rawPath = p; break; }
-      }
-    }
-    if (rawPath) { logger.info({ videoId, url: ytUrl }, "Download succeeded"); break; }
-    logger.warn({ videoId, url: ytUrl, err: lastErr.slice(0, 120) }, "attempt failed");
   }
 
   if (!rawPath) {
-    if (lastErr.includes("Sign in") || lastErr.includes("bot")) {
-      throw new Error("YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-    }
-    throw new Error("فشل التحميل من YouTube — " + lastErr.slice(0, 200));
+    // Show the REAL yt-dlp error — no hiding
+    throw new Error(fullStderr.slice(0, 500) || "yt-dlp لم يُنشئ أي ملف");
   }
 
   if (rawPath === mp3Path) return mp3Path;
