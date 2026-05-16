@@ -2,18 +2,15 @@
 nixPkgs = ["nodejs_22", "python312", "gcc", "ffmpeg", "yt-dlp"]
 
 [phases.install]
-cmds = [
-  "npm install -g pnpm@10",
-  "pnpm install --frozen-lockfile"
-]
+cmds = ["npm install"]
 
 [phases.build]
 cmds = [
-  "pnpm --filter @workspace/api-server run build",
-  "python3 -m venv artifacts/api-server/.venv",
-  "artifacts/api-server/.venv/bin/pip install --upgrade pip",
-  "artifacts/api-server/.venv/bin/pip install pyrogram tgcrypto py-tgcalls"
+  "node build.mjs",
+  "python3 -m venv .venv",
+  ".venv/bin/pip install --upgrade pip",
+  ".venv/bin/pip install pyrogram tgcrypto py-tgcalls"
 ]
 
 [start]
-cmd = "node artifacts/api-server/dist/index.mjs"
+cmd = "node dist/index.mjs"

@@ -1,3 +1,33 @@
-# Music-Bot-Play
+# Music Bot Play 🎵
 
-Telegram Music Bot with Arabic commands, YouTube download, and voice call streaming.
+بوت تيليجرام للموسيقى مع دعم المكالمات الصوتية وتنزيل الأغاني من يوتيوب.
+
+## الأوامر
+
+| الأمر | الوظيفة |
+|-------|---------|
+| `يوت [أغنية]` | تنزيل وإرسال الأغنية |
+| `بحث [أغنية]` | بحث يوتيوب مع قائمة اختيار |
+| `شغل [أغنية]` | تشغيل في مكالمة المجموعة |
+| `وقف` | إيقاف التشغيل |
+| `/qr` | تسجيل دخول عبر QR code |
+| `/status` | حالة الحساب المتصل |
+| `/start` | رسالة المساعدة |
+
+## متغيرات البيئة
+
+| المتغير | المصدر |
+|---------|--------|
+| `TELEGRAM_BOT_TOKEN` | @BotFather |
+| `TELEGRAM_API_ID` | my.telegram.org |
+| `TELEGRAM_API_HASH` | my.telegram.org |
+| `TELEGRAM_SESSION_STRING` | اختياري — لتخطي QR login |
+| `PORT` | يُضبط تلقائياً من Railway |
+
+## النشر على Railway
+
+1. Fork أو clone هذا المستودع
+2. أنشئ مشروعاً جديداً على [Railway](https://railway.com)
+3. اربطه بالمستودع
+4. أضف متغيرات البيئة
+5. Deploy!
