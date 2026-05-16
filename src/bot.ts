@@ -16,6 +16,7 @@ const BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
 const bot = new Bot(BOT_TOKEN);
+let BOT_USERNAME = "MusicBot";
 
 // ── yt-dlp detection ──────────────────────────────────────────────────────
 function findYtDlp(): string {
@@ -206,7 +207,7 @@ async function sendAudio(
   if (cached) {
     if (statusMsgId) await api.deleteMessage(chatId, statusMsgId).catch(() => {});
     await api.sendAudio(chatId, cached, {
-      caption: `🎵 *${video.title}*\n👤 ${video.uploader} · ⏱ ${video.duration}\n⚡ من الكاش`,
+      caption: `• @${BOT_USERNAME} ♪ ${video.duration}`,
       parse_mode: "Markdown",
     });
     return;
@@ -445,6 +446,12 @@ async function notifyAll(text: string) {
 }
 
 export async function startBot() {
+  // Get bot username for captions
+  try {
+    const me = await bot.api.getMe();
+    BOT_USERNAME = me.username ?? BOT_USERNAME;
+    logger.info({ username: BOT_USERNAME }, "Bot username");
+  } catch { /* use default */ }
   await loadCache();
   voiceManager.start();
   voiceManager.once("ready", async () => {
