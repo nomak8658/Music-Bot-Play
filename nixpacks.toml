@@ -12,7 +12,7 @@ cmds = [
   "pnpm --filter @workspace/api-server run build",
   "python3 -m venv artifacts/api-server/.venv",
   "artifacts/api-server/.venv/bin/pip install --upgrade pip",
-  "artifacts/api-server/.venv/bin/pip install pyrogram tgcrypto pytgcalls"
+  "artifacts/api-server/.venv/bin/pip install pyrogram tgcrypto py-tgcalls"
 ]
 
 [start]
