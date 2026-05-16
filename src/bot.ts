@@ -92,7 +92,7 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
     "--ignore-errors",
     "--socket-timeout", "30",
     "--no-check-certificates",
-    "--extractor-args", "youtube:player_client=ios,mweb",
+    "--extractor-args", "youtube:player_client=tv_embedded,mweb",
     "--add-header", "Accept-Language:ar-SA,ar;q=0.9,en;q=0.8",
   ];
 
@@ -142,7 +142,7 @@ async function downloadAudio(videoId: string): Promise<string> {
     "--socket-timeout", "30",
     "--no-check-certificates",
     "--ignore-errors",
-    "--extractor-args", "youtube:player_client=ios,mweb",
+    "--extractor-args", "youtube:player_client=tv_embedded,mweb",
     "--add-header", "Accept-Language:ar-SA,ar;q=0.9,en;q=0.8",
     "--quiet", "--no-warnings",
   ];
