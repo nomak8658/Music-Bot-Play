@@ -137,7 +137,9 @@ async function downloadAudio(videoId: string): Promise<string> {
   const rawTemplate = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
-    "--format", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
     "-o", rawTemplate,
     "--no-playlist",
     "--socket-timeout", "30",
@@ -147,7 +149,7 @@ async function downloadAudio(videoId: string): Promise<string> {
     ...cookieArgs(),
   ];
 
-  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
+  const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4"];
   let rawPath: string | undefined;
 
   try {
