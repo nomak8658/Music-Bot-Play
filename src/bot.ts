@@ -129,65 +129,66 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   }));
 }
 
-// ── Download audio (YouTube via yt-dlp + cookies) ─────────────────────────
+// ── Download audio ────────────────────────────────────────────────────────
 async function downloadAudio(videoId: string): Promise<string> {
   const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
   if (existsSync(mp3Path)) return mp3Path;
 
-  const rawTemplate = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
-  const args = [
-    `https://www.youtube.com/watch?v=${videoId}`,
-    "-x",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
-    "-o", rawTemplate,
-    "--no-playlist",
-    "--socket-timeout", "30",
-    "--no-check-certificates",
-    "--no-warnings",
-    "--quiet",
-    ...cookieArgs(),
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
+  const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
+
+  // Try multiple format strategies in order
+  const strategies = [
+    // 1. bestaudio — most common path
+    ["--format", "bestaudio", "-o", outTpl, "--no-playlist", "--socket-timeout", "30",
+     "--no-check-certificates", "--no-warnings", ...cookieArgs()],
+    // 2. bestaudio/best — fallback
+    ["--format", "bestaudio/best", "-o", outTpl, "--no-playlist", "--socket-timeout", "30",
+     "--no-check-certificates", "--no-warnings", ...cookieArgs()],
+    // 3. any format, let yt-dlp pick — last resort
+    ["-f", "b", "-o", outTpl, "--no-playlist", "--socket-timeout", "30",
+     "--no-check-certificates", "--no-warnings", ...cookieArgs()],
   ];
 
-  const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4"];
   let rawPath: string | undefined;
+  let lastErr = "";
 
-  try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 180_000 });
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    // Check if file was created despite error exit code
+  for (const args of strategies) {
+    try {
+      await execFileAsync(YT_DLP_BIN, [url, ...args], { timeout: 180_000 });
+    } catch (err: unknown) {
+      lastErr = ((err as { stderr?: string; message?: string }).stderr ?? (err as Error).message ?? "").slice(0, 500);
+    }
+    // Check if file was created (even if exit code != 0)
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
       if (existsSync(p)) { rawPath = p; break; }
     }
-    if (!rawPath) {
-      const errText = (e.stderr ?? e.message ?? "فشل التحميل").slice(0, 500);
-      // Give a user-friendly message for cookie issues
-      if (errText.includes("Sign in") || errText.includes("bot")) {
-        throw new Error("YouTube يطلب تسجيل دخول. أضف YOUTUBE_COOKIES في Railway ← Variables");
-      }
-      throw new Error(errText);
-    }
+    if (rawPath) break;
+    logger.warn({ videoId, lastErr: lastErr.slice(0, 100) }, "Strategy failed, trying next");
   }
 
   if (!rawPath) {
-    for (const ext of exts) {
-      const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) { rawPath = p; break; }
+    if (lastErr.includes("Sign in") || lastErr.includes("bot")) {
+      throw new Error("YouTube يطلب تسجيل دخول. تأكد من إضافة YOUTUBE_COOKIES في Railway");
     }
+    throw new Error(lastErr.slice(0, 300) || "فشل التحميل — جرّب أغنية ثانية");
   }
-  if (!rawPath) throw new Error("الملف لم يُنشأ، جرّب مرة ثانية");
+
+  // Already mp3? Done
   if (rawPath === mp3Path) return mp3Path;
 
   // Convert to mp3 with ffmpeg
   await new Promise<void>((resolve, reject) => {
-    const ff = spawn("ffmpeg", ["-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path], { stdio: "pipe" });
-    let stderr = "";
-    ff.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const ff = spawn("ffmpeg", [
+      "-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path,
+    ], { stdio: "pipe" });
+    let ffErr = "";
+    ff.stderr?.on("data", (d: Buffer) => { ffErr += d.toString(); });
     ff.on("close", code => {
       if (code === 0 && existsSync(mp3Path)) resolve();
-      else reject(new Error(`ffmpeg فشل: ${stderr.slice(-150)}`));
+      else reject(new Error(`ffmpeg فشل (${code}): ${ffErr.slice(-150)}`));
     });
     ff.on("error", reject);
     setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 120_000);
