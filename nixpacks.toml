@@ -6,7 +6,7 @@ cmds = ["npm install"]
 
 [phases.build]
 cmds = [
-  "pip install -q --upgrade yt-dlp",
+  "python3 -m pip install -q --upgrade yt-dlp",
   "node build.mjs",
   "python3 -m venv .venv",
   ".venv/bin/pip install -q --upgrade pip",
