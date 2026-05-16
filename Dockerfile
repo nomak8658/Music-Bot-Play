@@ -5,9 +5,10 @@ RUN apt-get update && apt-get install -y \
     ffmpeg gcc curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp — try pipx first, fallback to direct binary
-RUN pip3 install yt-dlp --break-system-packages 2>/dev/null || \
-    (curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp)
+# Always get the latest yt-dlp binary directly from GitHub releases
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp && \
+    /usr/local/bin/yt-dlp --version
 
 WORKDIR /app
 
