@@ -134,30 +134,35 @@ async function downloadAudio(videoId: string): Promise<string> {
   const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
   if (existsSync(mp3Path)) return mp3Path;
 
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
-  // mweb client → no PO token needed, works on cloud servers with cookies
-  const baseArgs = [
-    "--extractor-args", "youtube:player_client=mweb",
-    "--no-playlist",
-    "--socket-timeout", "30",
-    "--no-check-certificates",
-    "--no-warnings",
+  const common = [
+    "--no-playlist", "--socket-timeout", "30",
+    "--no-check-certificates", "--no-warnings",
     ...cookieArgs(),
   ];
 
-  const strategies: string[][] = [
-    ["--format", "bestaudio",      "-o", outTpl, ...baseArgs],
-    ["--format", "bestaudio/best", "-o", outTpl, ...baseArgs],
-    ["--format", "worstaudio/worst","-o", outTpl, ...baseArgs], // last resort
-  ];
+  // Try multiple URL strategies — YouTube Music is less restricted than YouTube
+  const attempts = [
+    // 1. YouTube Music URL (different CDN, less bot-blocking)
+    [`https://music.youtube.com/watch?v=${videoId}`, ["-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", outTpl, ...common]],
+    // 2. YouTube with no format filter (let yt-dlp pick anything)
+    [`https://www.youtube.com/watch?v=${videoId}`,   ["-x", "--audio-format", "mp3", "--audio-quality", "0", "-o", outTpl, ...common]],
+    // 3. YouTube with explicit bestaudio (no ext filter)
+    [`https://www.youtube.com/watch?v=${videoId}`,   ["--format", "bestaudio/best", "-o", outTpl, ...common]],
+  ] as [string, string[]][];
 
   let rawPath: string | undefined;
   let lastErr = "";
 
-  for (const args of strategies) {
+  for (const [ytUrl, args] of attempts) {
+    // Clean up any partial files before retry
+    for (const ext of exts) {
+      const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
+      if (existsSync(p)) { try { (await import("node:fs")).unlinkSync(p); } catch {/**/ } }
+    }
+
     try {
       await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 180_000 });
     } catch (err: unknown) {
@@ -165,20 +170,20 @@ async function downloadAudio(videoId: string): Promise<string> {
     }
     for (const ext of exts) {
       const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
-      if (existsSync(p) && (require("node:fs").statSync(p).size > 0)) { rawPath = p; break; }
+      if (existsSync(p)) {
+        const { statSync } = await import("node:fs");
+        if (statSync(p).size > 1000) { rawPath = p; break; }
+      }
     }
-    if (rawPath) break;
-    logger.warn({ videoId, strategy: args[1] }, "strategy failed, trying next");
+    if (rawPath) { logger.info({ videoId, url: ytUrl }, "Download succeeded"); break; }
+    logger.warn({ videoId, url: ytUrl, err: lastErr.slice(0, 120) }, "attempt failed");
   }
 
   if (!rawPath) {
     if (lastErr.includes("Sign in") || lastErr.includes("bot")) {
       throw new Error("YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
     }
-    if (lastErr.includes("format is not available") || lastErr.includes("Requested format")) {
-      throw new Error("لا تتوفر صيغ صوتية لهذا الفيديو — جرّب فيديو آخر");
-    }
-    throw new Error(lastErr.slice(0, 300) || "فشل التحميل — جرّب أغنية ثانية");
+    throw new Error("فشل التحميل من YouTube — " + lastErr.slice(0, 200));
   }
 
   if (rawPath === mp3Path) return mp3Path;
@@ -192,7 +197,7 @@ async function downloadAudio(videoId: string): Promise<string> {
     ff.stderr?.on("data", (d: Buffer) => { ffErr += d.toString(); });
     ff.on("close", code => {
       if (code === 0 && existsSync(mp3Path)) resolve();
-      else reject(new Error(`ffmpeg فشل (${code}): ${ffErr.slice(-200)}`));
+      else reject(new Error(`ffmpeg (${code}): ${ffErr.slice(-200)}`));
     });
     ff.on("error", reject);
     setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 120_000);
