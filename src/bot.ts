@@ -159,10 +159,8 @@ async function downloadAudio(videoId: string): Promise<string> {
     "--js-runtimes", `node:${nodeBin}`,
     "--retries", "3",
     "--fragment-retries", "3",
-    "--concurrent-fragments", "8",      // parallel fragment downloads
-    "--no-part",                         // no rename overhead
-    "--downloader", "aria2c",            // multi-connection download (3-5x faster)
-    "--downloader-args", "aria2c:-x 16 -s 16 -k 1M --quiet",
+    "--concurrent-fragments", "4",
+    "--no-part",
     ...cookieArgs(),
   ];
 
