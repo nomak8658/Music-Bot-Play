@@ -173,8 +173,10 @@ async function _doDownload(videoId: string): Promise<string> {
         logger.info({ videoId, bytes: buf.byteLength }, "proxy download ok");
         return outPath;
       }
+      fetchErr = `empty response (${buf.byteLength} bytes)`;
     } else {
-      fetchErr = `HTTP ${res.status}`;
+      const errBody = await res.text().catch(() => "");
+      fetchErr = `HTTP ${res.status}: ${errBody.slice(0, 100)}`;
     }
   } catch (err) {
     fetchErr = String(err).slice(0, 150);
