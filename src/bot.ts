@@ -133,12 +133,9 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
 // ── In-progress downloads map (prevents duplicate parallel downloads) ───────
 const downloadingNow = new Map<string, Promise<string>>();
 
-// ── Download audio ────────────────────────────────────────────────────────
 function downloadAudio(videoId: string): Promise<string> {
-  // If already downloading this video, reuse the same promise
   const existing = downloadingNow.get(videoId);
   if (existing) return existing;
-
   const promise = _doDownload(videoId).finally(() => downloadingNow.delete(videoId));
   downloadingNow.set(videoId, promise);
   return promise;
@@ -146,8 +143,9 @@ function downloadAudio(videoId: string): Promise<string> {
 
 async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
-  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
+  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
 
+  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -160,7 +158,8 @@ async function _doDownload(videoId: string): Promise<string> {
   const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
   const nodeBin = process.execPath;
 
-  const base = [
+  const args = [
+    ytUrl,
     "--format", "bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
@@ -168,49 +167,41 @@ async function _doDownload(videoId: string): Promise<string> {
     "--no-check-certificates",
     "--no-warnings",
     "--geo-bypass",
-    "--retries", "1",
-    "--fragment-retries", "1",
+    "--geo-bypass-country", "SA",
+    "--js-runtimes", `node:${nodeBin}`,
+    "--retries", "2",
+    "--fragment-retries", "2",
     "--no-write-thumbnail",
     "--no-write-info-json",
     ...cookieArgs(),
   ];
 
-  const strategies: Array<[string, string[]]> = [
-    ["js-runtime",  [...base, "--js-runtimes", `node:${nodeBin}`]],
-    ["mweb-client", [...base, "--extractor-args", "youtube:player_client=mweb"]],
-    ["plain",       [...base]],
-  ];
-
-  let lastStderr = "";
-
-  for (const [name, args] of strategies) {
-    // Clean partial files
-    for (const ext of exts) {
-      const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) try { (await import("node:fs")).unlinkSync(p); } catch {/**/}
-    }
-
-    try { await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 35_000 }); }
-    catch (err: unknown) {
-      const e = err as { stderr?: string; message?: string };
-      lastStderr = (e.stderr ?? e.message ?? "").trim();
-      logger.warn({ videoId, strategy: name, err: lastStderr.slice(0, 100) }, "strategy failed");
-    }
-
-    for (const ext of exts) {
-      const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-      if (existsSync(p)) {
-        const { statSync } = await import("node:fs");
-        if (statSync(p).size > 1000) { logger.info({ videoId, strategy: name }, "ok"); return p; }
-      }
-    }
+  let stderr = "";
+  try {
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 60_000 });
+  } catch (err: unknown) {
+    const e = err as { stderr?: string; message?: string };
+    stderr = (e.stderr ?? e.message ?? "").trim();
+    logger.error({ videoId, stderr: stderr.slice(0, 400) }, "yt-dlp error");
   }
 
-  if (lastStderr.includes("429") || lastStderr.includes("Too Many Requests"))
+  // Use glob-style search to find ANY downloaded file for this videoId
+  const { readdirSync, statSync } = await import("node:fs");
+  const files = readdirSync(cacheDir).filter(f =>
+    f.startsWith(`tgbot_${videoId}.`) && !f.endsWith(".part")
+  );
+  for (const file of files) {
+    const p = join(cacheDir, file);
+    if (statSync(p).size > 1000) { logger.info({ videoId, file }, "download ok"); return p; }
+  }
+
+  if (stderr.includes("429") || stderr.includes("Too Many Requests"))
     throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (lastStderr.includes("Sign in") || lastStderr.includes("bot"))
+  if (stderr.includes("Sign in") || stderr.includes("bot") || stderr.includes("cookie"))
     throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  throw new Error("فشل التحميل: " + (lastStderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  if (stderr.includes("not available") || stderr.includes("This video is unavailable"))
+    throw new Error("⚠️ هذا الفيديو غير متاح — جرّب أغنية أخرى");
+  throw new Error("فشل التحميل: " + (stderr.slice(0, 300) || "لم ينشأ أي ملف"));
 }
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
