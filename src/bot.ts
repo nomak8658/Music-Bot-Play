@@ -151,7 +151,7 @@ async function downloadAudio(videoId: string): Promise<string> {
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
     // Best audio without re-encoding — m4a preferred (Telegram plays natively)
-    "--format", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+    "--format", "bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
     "--socket-timeout", "20",
@@ -186,8 +186,6 @@ async function downloadAudio(videoId: string): Promise<string> {
 
   if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests"))
     throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (fullStderr.includes("not available") || fullStderr.includes("unavailable"))
-    throw new Error("⚠️ الفيديو غير متاح في منطقة السيرفر");
   if (fullStderr.includes("Sign in") || fullStderr.includes("bot"))
     throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
   throw new Error("فشل التحميل: " + (fullStderr.slice(0, 300) || "لم ينشأ أي ملف"));
