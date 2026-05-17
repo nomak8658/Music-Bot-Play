@@ -156,48 +156,62 @@ async function _doDownload(videoId: string): Promise<string> {
 
   const outTpl  = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
   const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
-  const args = [
-    ytUrl,
-    "--format", "bestaudio/best",
-    "-o", outTpl,
-    "--no-playlist",
-    "--socket-timeout", "20",
-    "--no-check-certificates",
-    "--no-warnings",
-    "--extractor-args", "youtube:player_client=android_testsuite,ios,mweb",
-    "--retries", "3",
-    "--fragment-retries", "3",
-    "--no-write-thumbnail",
-    "--no-write-info-json",
-    ...cookieArgs(),
-  ];
+  // Try multiple player clients — android_testsuite works without PO token on cloud IPs
+  const clients = ["android_testsuite", "android", "ios", "mweb"];
+  const { readdirSync, statSync, unlinkSync } = await import("node:fs");
+  let lastStderr = "";
 
-  let stderr = "";
-  try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 60_000 });
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    stderr = (e.stderr ?? e.message ?? "").trim();
-    logger.error({ videoId, stderr: stderr.slice(0, 400) }, "yt-dlp error");
+  for (const client of clients) {
+    // Clean stale partial files before each attempt
+    try {
+      readdirSync(cacheDir)
+        .filter(fn => fn.startsWith(`tgbot_${videoId}.`))
+        .forEach(fn => { try { unlinkSync(join(cacheDir, fn)); } catch {/**/ } });
+    } catch {/**/}
+
+    const args = [
+      ytUrl,
+      "--format", "bestaudio/best",
+      "-o", outTpl,
+      "--no-playlist",
+      "--socket-timeout", "20",
+      "--no-check-certificates",
+      "--no-warnings",
+      "--extractor-args", `youtube:player_client=${client}`,
+      "--retries", "2",
+      "--fragment-retries", "2",
+      "--no-write-thumbnail",
+      "--no-write-info-json",
+      ...cookieArgs(),
+    ];
+
+    let stderr = "";
+    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); }
+    catch (err: unknown) {
+      const e = err as { stderr?: string; message?: string };
+      stderr = (e.stderr ?? e.message ?? "").trim();
+    }
+
+    const files = readdirSync(cacheDir).filter(fn =>
+      fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
+    );
+    for (const file of files) {
+      const p = join(cacheDir, file);
+      if (statSync(p).size > 1000) {
+        logger.info({ videoId, client }, "download ok");
+        return p;
+      }
+    }
+
+    lastStderr = stderr;
+    logger.warn({ videoId, client, err: stderr.slice(0, 120) }, "client failed, trying next");
   }
 
-  // Use glob-style search to find ANY downloaded file for this videoId
-  const { readdirSync, statSync } = await import("node:fs");
-  const files = readdirSync(cacheDir).filter(f =>
-    f.startsWith(`tgbot_${videoId}.`) && !f.endsWith(".part")
-  );
-  for (const file of files) {
-    const p = join(cacheDir, file);
-    if (statSync(p).size > 1000) { logger.info({ videoId, file }, "download ok"); return p; }
-  }
-
-  if (stderr.includes("429") || stderr.includes("Too Many Requests"))
+  if (lastStderr.includes("429") || lastStderr.includes("Too Many Requests"))
     throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (stderr.includes("Sign in") || stderr.includes("bot") || stderr.includes("cookie"))
+  if (lastStderr.includes("Sign in") || lastStderr.includes("cookie"))
     throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  if (stderr.includes("not available") || stderr.includes("This video is unavailable"))
-    throw new Error("⚠️ هذا الفيديو غير متاح — جرّب أغنية أخرى");
-  throw new Error("فشل التحميل: " + (stderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  throw new Error("فشل التحميل: " + (lastStderr.slice(0, 300) || "لم ينشأ أي ملف"));
 }
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
