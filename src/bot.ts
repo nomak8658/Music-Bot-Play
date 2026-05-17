@@ -131,13 +131,11 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
 }
 
 // ── Download audio ────────────────────────────────────────────────────────
-// Downloads best audio directly — no ffmpeg re-encoding (saves 2-4s)
 async function downloadAudio(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
-  // Preferred formats Telegram plays natively (no conversion needed)
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
 
-  // Return cached file if exists
+  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -146,11 +144,12 @@ async function downloadAudio(videoId: string): Promise<string> {
     }
   }
 
-  const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
+  const outTpl  = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
+  const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
+  const nodeBin = process.execPath;
 
-  const args = [
-    `https://www.youtube.com/watch?v=${videoId}`,
-    // Best audio without re-encoding — m4a preferred (Telegram plays natively)
+  // Base flags shared by all attempts
+  const base = [
     "--format", "bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
@@ -160,35 +159,54 @@ async function downloadAudio(videoId: string): Promise<string> {
     "--geo-bypass",
     "--retries", "2",
     "--fragment-retries", "2",
-    // Skip unused metadata to speed up extraction
     "--no-write-thumbnail",
     "--no-write-info-json",
-    "--no-write-comments",
     ...cookieArgs(),
   ];
 
-  let fullStderr = "";
-  try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 90_000 });
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    fullStderr = (e.stderr ?? e.message ?? "").trim();
-    logger.error({ videoId, stderr: fullStderr.slice(0, 400) }, "yt-dlp failed");
-  }
+  // Try multiple strategies — some videos need specific player clients
+  const strategies = [
+    // 1. Default with node JS runtime (handles most videos)
+    [...base, "--js-runtimes", `node:${nodeBin}`],
+    // 2. mweb client — no JS needed, works on cloud IPs
+    [...base, "--extractor-args", "youtube:player_client=mweb"],
+    // 3. Plain — no extra args (last resort)
+    [...base],
+  ];
 
-  for (const ext of exts) {
-    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-    if (existsSync(p)) {
-      const { statSync } = await import("node:fs");
-      if (statSync(p).size > 1000) return p;
+  let lastStderr = "";
+
+  for (const args of strategies) {
+    // Clean up partial files from previous attempt
+    for (const ext of exts) {
+      const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+      if (existsSync(p)) try { (await import("node:fs")).unlinkSync(p); } catch {/**/}
     }
+
+    try { await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 60_000 }); }
+    catch (err: unknown) {
+      const e = err as { stderr?: string; message?: string };
+      lastStderr = (e.stderr ?? e.message ?? "").trim();
+    }
+
+    for (const ext of exts) {
+      const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+      if (existsSync(p)) {
+        const { statSync } = await import("node:fs");
+        if (statSync(p).size > 1000) {
+          logger.info({ videoId, strategy: args.find(a => a.includes("player_client") || a.includes("js-runtimes")) ?? "default" }, "download ok");
+          return p;
+        }
+      }
+    }
+    logger.warn({ videoId, stderr: lastStderr.slice(0, 120) }, "strategy failed, trying next");
   }
 
-  if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests"))
+  if (lastStderr.includes("429") || lastStderr.includes("Too Many Requests"))
     throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (fullStderr.includes("Sign in") || fullStderr.includes("bot"))
+  if (lastStderr.includes("Sign in") || lastStderr.includes("bot"))
     throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  throw new Error("فشل التحميل: " + (fullStderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  throw new Error("فشل التحميل: " + (lastStderr.slice(0, 300) || "لم ينشأ أي ملف"));
 }
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
