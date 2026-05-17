@@ -208,14 +208,13 @@ async function sendAudio(
     if (statusMsgId) await api.deleteMessage(chatId, statusMsgId).catch(() => {});
     await api.sendAudio(chatId, cached, {
       caption: `• @${BOT_USERNAME} ♪ ${video.duration}`,
-      parse_mode: "Markdown",
     });
     return;
   }
 
   let dlMsgId = statusMsgId;
   if (!dlMsgId) {
-    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n*${video.title}*`, { parse_mode: "Markdown" })).message_id;
+    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل… ${video.title}`)).message_id;
   } else {
     await safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
   }
@@ -227,7 +226,7 @@ async function sendAudio(
       chatId,
       new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.mp3`),
       { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
-        caption: `🎵 *${video.title}*\n👤 ${video.uploader} · ⏱ ${video.duration}`, parse_mode: "Markdown" },
+        caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
     );
     if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
     await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
