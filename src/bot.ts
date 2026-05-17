@@ -329,8 +329,10 @@ bot.on("message:text", async ctx => {
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
 
-  // Track messages for active challenge
-  if (isActive() && getChatId() === chatId && ctx.from) {
+  // Track messages for active challenge (exclude bot commands)
+  const isBotCommand = /^(يوت|يوتيوب|بحث|شغل|تحدي|وقف|التالي|قائمة)(\s|$)/u.test(text)
+    || text.startsWith("/");
+  if (isActive() && getChatId() === chatId && ctx.from && !isBotCommand) {
     const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ")
       || ctx.from.username || String(ctx.from.id);
     countMessage(String(ctx.from.id), name);
