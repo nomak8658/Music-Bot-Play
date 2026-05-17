@@ -154,24 +154,62 @@ async function _doDownload(videoId: string): Promise<string> {
     }
   }
 
-  const outTpl  = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
-  const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
-  // Try multiple player clients — android_testsuite works without PO token on cloud IPs
-  const clients = ["android_testsuite", "android", "ios", "mweb"];
-  const { readdirSync, statSync, unlinkSync } = await import("node:fs");
-  let lastStderr = "";
+  // ── Strategy 1: Invidious API (bypasses YouTube CDN IP restrictions) ───────
+  const invidiousInstances = [
+    "https://invidious.nerdvpn.de",
+    "https://inv.riverside.rocks",
+    "https://yt.artemislena.eu",
+    "https://invidious.slipfox.xyz",
+    "https://iv.datura.network",
+  ];
 
-  for (const client of clients) {
-    // Clean stale partial files before each attempt
+  for (const host of invidiousInstances) {
     try {
-      readdirSync(cacheDir)
-        .filter(fn => fn.startsWith(`tgbot_${videoId}.`))
-        .forEach(fn => { try { unlinkSync(join(cacheDir, fn)); } catch {/**/ } });
-    } catch {/**/}
+      const infoUrl = `${host}/api/v1/videos/${videoId}?fields=adaptiveFormats,formatStreams`;
+      const res = await fetch(infoUrl, { signal: AbortSignal.timeout(10_000) });
+      if (!res.ok) continue;
+      const info = await res.json() as {
+        adaptiveFormats?: { itag: number; type: string; url: string; bitrate?: number }[];
+        formatStreams?: { itag: number; type: string; url: string }[];
+      };
 
+      // Pick best audio-only format (prefer m4a/140, then webm/opus/251)
+      const audioFmts = (info.adaptiveFormats ?? []).filter(f => f.type.startsWith("audio/"));
+      audioFmts.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
+      const fmt = audioFmts[0] ?? (info.formatStreams ?? [])[0];
+      if (!fmt?.url) continue;
+
+      const ext = fmt.type.includes("mp4") || fmt.type.includes("m4a") ? "m4a" : "webm";
+      const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
+
+      // Download via Invidious proxy URL (no IP restriction)
+      const dlRes = await fetch(fmt.url, { signal: AbortSignal.timeout(60_000) });
+      if (!dlRes.ok) continue;
+
+      const { createWriteStream } = await import("node:fs");
+      const { Readable } = await import("node:stream");
+      const { finished } = await import("node:stream/promises");
+      const writer = createWriteStream(outPath);
+      await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(writer));
+
+      const { statSync } = await import("node:fs");
+      if (statSync(outPath).size > 1000) {
+        logger.info({ videoId, host, ext }, "invidious download ok");
+        return outPath;
+      }
+    } catch (err) {
+      logger.warn({ videoId, host, err: String(err).slice(0, 80) }, "invidious instance failed");
+    }
+  }
+
+  // ── Strategy 2: yt-dlp fallback (might work with cookies) ─────────────────
+  const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
+  const ytUrl  = `https://www.youtube.com/watch?v=${videoId}`;
+
+  for (const client of ["ios", "mweb", "android"]) {
     const args = [
       ytUrl,
-      "--format", "140/251/250/249/bestaudio/18/best",
+      "--format", "bestaudio/best",
       "-o", outTpl,
       "--no-playlist",
       "--socket-timeout", "20",
@@ -185,34 +223,24 @@ async function _doDownload(videoId: string): Promise<string> {
       ...cookieArgs(),
     ];
 
-    let stderr = "";
-    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); }
-    catch (err: unknown) {
-      const e = err as { stderr?: string; message?: string };
-      stderr = (e.stderr ?? e.message ?? "").trim();
-    }
+    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); } catch {/**/}
 
+    const { readdirSync, statSync, unlinkSync } = await import("node:fs");
     const files = readdirSync(cacheDir).filter(fn =>
       fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
     );
     for (const file of files) {
       const p = join(cacheDir, file);
       if (statSync(p).size > 1000) {
-        logger.info({ videoId, client }, "download ok");
+        logger.info({ videoId, client }, "yt-dlp fallback ok");
         return p;
       }
     }
-
-    lastStderr = stderr;
-    logger.warn({ videoId, client, err: stderr.slice(0, 120) }, "client failed, trying next");
   }
 
-  if (lastStderr.includes("429") || lastStderr.includes("Too Many Requests"))
-    throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (lastStderr.includes("Sign in") || lastStderr.includes("cookie"))
-    throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  throw new Error("فشل التحميل: " + (lastStderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  throw new Error("فشل التحميل — جرّب أغنية أخرى أو أعد المحاولة بعد دقيقة");
 }
+
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
 async function sendAudio(
