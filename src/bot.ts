@@ -138,8 +138,9 @@ async function downloadAudio(videoId: string): Promise<string> {
   const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
-  // Absolute minimal command — no format filter, no extractor-args, just cookies
-  // Capture FULL stderr so we know the real error
+  // Find node binary for yt-dlp JS extraction (critical for YouTube formats)
+  const nodeBin = process.execPath; // always correct in Node.js runtime
+
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
     "-x", "--audio-format", "mp3", "--audio-quality", "0",
@@ -147,19 +148,22 @@ async function downloadAudio(videoId: string): Promise<string> {
     "--no-playlist",
     "--socket-timeout", "30",
     "--no-check-certificates",
+    "--js-runtimes", `node:${nodeBin}`,   // fix: tell yt-dlp where node is
+    "--retries", "5",                      // retry on 429
+    "--retry-sleep", "exp=1:30:2",         // exponential backoff up to 30s
+    "--fragment-retries", "5",
     ...cookieArgs(),
-    // NO --quiet, NO --no-warnings — we need the real error
   ];
 
   let rawPath: string | undefined;
   let fullStderr = "";
 
   try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 180_000 });
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 300_000 });
   } catch (err: unknown) {
     const e = err as { stderr?: string; stdout?: string; message?: string };
     fullStderr = (e.stderr ?? e.message ?? "").trim();
-    logger.error({ videoId, stderr: fullStderr }, "yt-dlp failed");
+    logger.error({ videoId, stderr: fullStderr.slice(0, 400) }, "yt-dlp failed");
   }
 
   for (const ext of exts) {
@@ -171,8 +175,13 @@ async function downloadAudio(videoId: string): Promise<string> {
   }
 
   if (!rawPath) {
-    // Show the REAL yt-dlp error — no hiding
-    throw new Error(fullStderr.slice(0, 500) || "yt-dlp لم يُنشئ أي ملف");
+    if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests")) {
+      throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
+    }
+    if (fullStderr.includes("Sign in") || fullStderr.includes("bot")) {
+      throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
+    }
+    throw new Error("فشل التحميل: " + fullStderr.slice(0, 300));
   }
 
   if (rawPath === mp3Path) return mp3Path;
