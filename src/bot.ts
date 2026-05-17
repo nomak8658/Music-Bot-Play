@@ -60,7 +60,12 @@ if (COOKIE_PATH) logger.info("YouTube cookies loaded ✓");
 else logger.warn("No YouTube cookies — bot may get blocked. Add YOUTUBE_COOKIES env var.");
 
 // ── File-ID cache ─────────────────────────────────────────────────────────
-const CACHE_FILE = join(__dirname, "..", "cache.json");
+// /data is a Railway persistent Volume — survives redeployments
+// Fallback to local dist dir if /data is not mounted
+import { mkdirSync } from "node:fs";
+const DATA_DIR = process.env.CACHE_DIR ?? "/data";
+try { mkdirSync(DATA_DIR, { recursive: true }); } catch { /**/ }
+const CACHE_FILE = join(DATA_DIR, "cache.json");
 const fileIdCache = new Map<string, string>();
 
 async function loadCache() {
