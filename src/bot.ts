@@ -145,6 +145,7 @@ async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
 
+  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -153,80 +154,31 @@ async function _doDownload(videoId: string): Promise<string> {
     }
   }
 
-  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
-  // ── Strategy 1: cobalt.tools new API (v10+) ────────────────────────────────
+  // ── Use Replit proxy server (Replit IP is not blocked by YouTube CDN) ───────
+  const PROXY = "https://0ba9cc3f-9ac7-4850-8935-6f7c47681769-00-29a83w15noc7w.picard.replit.dev/api/dl/${videoId}";
   try {
-    const res = await fetch("https://api.cobalt.tools/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-      },
-      body: JSON.stringify({
-        url: ytUrl,
-        downloadMode: "audio",
-        audioFormat: "best",
-      }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    const data = await res.json() as { status: string; url?: string; error?: unknown };
-    logger.info({ videoId, cobaltStatus: data.status, cobaltUrl: data.url?.slice(0,60) }, "cobalt response");
-    if (data.url && (data.status === "redirect" || data.status === "tunnel" || data.status === "stream")) {
-      const dlRes = await fetch(data.url, { signal: AbortSignal.timeout(90_000) });
-      if (dlRes.ok) {
-        const ct = dlRes.headers.get("content-type") ?? "";
-        const ext = ct.includes("webm") || ct.includes("opus") ? "webm" : "m4a";
-        const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
-        const { createWriteStream } = await import("node:fs");
-        const { Readable } = await import("node:stream");
-        const { finished } = await import("node:stream/promises");
-        await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(createWriteStream(outPath)));
-        const { statSync } = await import("node:fs");
-        if (statSync(outPath).size > 1000) {
-          logger.info({ videoId }, "cobalt download ok");
-          return outPath;
-        }
+    const res = await fetch(PROXY, { signal: AbortSignal.timeout(120_000) });
+    if (res.ok) {
+      const ct = res.headers.get("content-type") ?? "";
+      const ext = ct.includes("webm") || ct.includes("opus") ? "webm" : "m4a";
+      const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
+      const { createWriteStream } = await import("node:fs");
+      const { Readable } = await import("node:stream");
+      const { finished } = await import("node:stream/promises");
+      await finished(Readable.fromWeb(res.body as import("stream/web").ReadableStream).pipe(createWriteStream(outPath)));
+      const { statSync } = await import("node:fs");
+      if (statSync(outPath).size > 1000) {
+        logger.info({ videoId }, "proxy download ok");
+        return outPath;
       }
+    } else {
+      logger.warn({ videoId, status: res.status }, "proxy returned error");
     }
   } catch (err) {
-    logger.warn({ videoId, err: String(err).slice(0, 150) }, "cobalt failed");
+    logger.warn({ videoId, err: String(err).slice(0, 150) }, "proxy fetch failed");
   }
 
-  // ── Strategy 2: yt-dlp with ios/mweb clients ───────────────────────────────
-  const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
-  for (const client of ["ios", "mweb", "android"]) {
-    const args = [
-      ytUrl,
-      "--format", "bestaudio/best",
-      "-o", outTpl,
-      "--no-playlist",
-      "--socket-timeout", "20",
-      "--no-check-certificates",
-      "--no-warnings",
-      "--extractor-args", `youtube:player_client=${client}`,
-      "--geo-bypass",
-      "--retries", "2",
-      "--fragment-retries", "2",
-      "--no-write-thumbnail",
-      "--no-write-info-json",
-      ...cookieArgs(),
-    ];
-    let stderr = "";
-    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); }
-    catch (e: unknown) { stderr = ((e as {stderr?:string}).stderr ?? String(e)).slice(0,200); }
-    logger.info({ videoId, client, stderr }, "yt-dlp attempt");
-    const { readdirSync, statSync } = await import("node:fs");
-    const files = readdirSync(cacheDir).filter(fn =>
-      fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
-    );
-    for (const file of files) {
-      const p = join(cacheDir, file);
-      if (statSync(p).size > 1000) { logger.info({ videoId, client }, "yt-dlp ok"); return p; }
-    }
-  }
-
-  throw new Error("فشل التحميل — جرّب أغنية أخرى أو أعد المحاولة بعد دقيقة");
+  throw new Error("فشل التحميل — الخادم غير متاح حالياً، أعد المحاولة بعد دقيقة");
 }
 
 
