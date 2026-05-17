@@ -162,21 +162,23 @@ async function _doDownload(videoId: string): Promise<string> {
     const res = await fetch(proxyUrl, { signal: controller.signal });
     clearTimeout(timer);
 
-    if (res.ok) {
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.ok && ct.includes("audio")) {
       const buf = await res.arrayBuffer();
       if (buf.byteLength > 1000) {
-        const ct = res.headers.get("content-type") ?? "";
-        const ext = ct.includes("webm") ? "webm" : "m4a";
+        const ext = ct.includes("mpeg") ? "mp3" : ct.includes("webm") ? "webm" : "m4a";
         const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
         const { writeFileSync } = await import("node:fs");
         writeFileSync(outPath, Buffer.from(buf));
         logger.info({ videoId, bytes: buf.byteLength }, "proxy download ok");
         return outPath;
       }
-      fetchErr = `empty response (${buf.byteLength} bytes)`;
+      fetchErr = `empty audio (${buf.byteLength} bytes)`;
     } else {
       const errBody = await res.text().catch(() => "");
-      fetchErr = `HTTP ${res.status}: ${errBody.slice(0, 100)}`;
+      let detail = errBody.slice(0, 150);
+      try { detail = JSON.parse(errBody).detail ?? JSON.parse(errBody).error ?? detail; } catch {}
+      fetchErr = `HTTP ${res.status}: ${detail}`;
     }
   } catch (err) {
     fetchErr = String(err).slice(0, 150);
@@ -213,29 +215,13 @@ async function sendAudio(
   let filePath: string | undefined;
   try {
     filePath = await downloadAudio(video.id);
-    let sent: Awaited<ReturnType<typeof api.sendAudio>> | undefined;
-    try {
-      sent = await api.sendAudio(
-        chatId,
-        new InputFile(createReadStream(filePath), `audio.m4a`),
-        { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
-          caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
-      );
-    } catch (sendErr) {
-      const msg = String(sendErr);
-      if (msg.includes("413") || msg.includes("Request Entity Too Large") || msg.includes("too large")) {
-        logger.warn({ videoId: video.id }, "file too large for sendAudio, using sendDocument");
-        await api.sendDocument(
-          chatId,
-          new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.webm`),
-          { caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
-        );
-        await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
-        return;
-      }
-      throw sendErr;
-    }
-    if (sent?.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
+    const sent = await api.sendAudio(
+      chatId,
+      new InputFile(createReadStream(filePath), `audio.mp3`),
+      { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
+        caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
+    );
+    if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
     await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
   } catch (err) {
     logger.error({ err, videoId: video.id }, "sendAudio failed");
