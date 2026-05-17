@@ -145,7 +145,6 @@ async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
 
-  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -154,31 +153,35 @@ async function _doDownload(videoId: string): Promise<string> {
     }
   }
 
-  // ── Use Replit proxy server (Replit IP is not blocked by YouTube CDN) ───────
-  const PROXY = "https://0ba9cc3f-9ac7-4850-8935-6f7c47681769-00-29a83w15noc7w.picard.replit.dev/api/dl/${videoId}";
+  // Use Replit proxy — Replit's IP is not blocked by YouTube CDN
+  const proxyUrl = `https://0ba9cc3f-9ac7-4850-8935-6f7c47681769-00-29a83w15noc7w.picard.replit.dev/api/dl/${videoId}`;
+  let fetchErr = "";
   try {
-    const res = await fetch(PROXY, { signal: AbortSignal.timeout(120_000) });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 110_000);
+    const res = await fetch(proxyUrl, { signal: controller.signal });
+    clearTimeout(timer);
+
     if (res.ok) {
-      const ct = res.headers.get("content-type") ?? "";
-      const ext = ct.includes("webm") || ct.includes("opus") ? "webm" : "m4a";
-      const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
-      const { createWriteStream } = await import("node:fs");
-      const { Readable } = await import("node:stream");
-      const { finished } = await import("node:stream/promises");
-      await finished(Readable.fromWeb(res.body as import("stream/web").ReadableStream).pipe(createWriteStream(outPath)));
-      const { statSync } = await import("node:fs");
-      if (statSync(outPath).size > 1000) {
-        logger.info({ videoId }, "proxy download ok");
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > 1000) {
+        const ct = res.headers.get("content-type") ?? "";
+        const ext = ct.includes("webm") ? "webm" : "m4a";
+        const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(outPath, Buffer.from(buf));
+        logger.info({ videoId, bytes: buf.byteLength }, "proxy download ok");
         return outPath;
       }
     } else {
-      logger.warn({ videoId, status: res.status }, "proxy returned error");
+      fetchErr = `HTTP ${res.status}`;
     }
   } catch (err) {
-    logger.warn({ videoId, err: String(err).slice(0, 150) }, "proxy fetch failed");
+    fetchErr = String(err).slice(0, 150);
   }
 
-  throw new Error("فشل التحميل — الخادم غير متاح حالياً، أعد المحاولة بعد دقيقة");
+  logger.error({ videoId, fetchErr }, "proxy failed");
+  throw new Error(`فشل التحميل — الخادم غير متاح (${fetchErr})`);
 }
 
 
