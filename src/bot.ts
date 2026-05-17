@@ -130,82 +130,88 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   }));
 }
 
-// ── Download audio (returns local path, with on-disk cache) ──────────────
+// ── Download audio ────────────────────────────────────────────────────────
 async function downloadAudio(videoId: string): Promise<string> {
-  const cacheDir = tmpdir();
-  const exts     = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
+  const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
+  if (existsSync(mp3Path)) return mp3Path;
 
-  for (const ext of exts) {
-    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-    if (existsSync(p)) {
-      const { statSync } = await import("node:fs");
-      if (statSync(p).size > 1000) return p;
-    }
-  }
+  const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
+  const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
-  const outTpl  = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
-  const nodeBin = process.execPath;
+  // Find node binary for yt-dlp JS extraction (critical for YouTube formats)
+  const nodeBin = process.execPath; // always correct in Node.js runtime
+
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
-    "--format", "bestaudio/best",
+    "-x", "--audio-format", "mp3", "--audio-quality", "0",
     "-o", outTpl,
-    "--no-playlist", "--socket-timeout", "30",
+    "--no-playlist",
+    "--socket-timeout", "30",
     "--no-check-certificates",
-    "--js-runtimes", `node:${nodeBin}`,
-    "--concurrent-fragments", "4",
-    "--no-part",
-    "--retries", "3", "--fragment-retries", "3",
+    "--js-runtimes", `node:${nodeBin}`,   // fix: tell yt-dlp where node is
+    "--retries", "5",                      // retry on 429
+    "--retry-sleep", "exp=1:30:2",         // exponential backoff up to 30s
+    "--fragment-retries", "5",
     ...cookieArgs(),
   ];
 
+  let rawPath: string | undefined;
   let fullStderr = "";
-  try { await execFileAsync(YT_DLP_BIN, args, { timeout: 300_000 }); }
-  catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
+
+  try {
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 300_000 });
+  } catch (err: unknown) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
     fullStderr = (e.stderr ?? e.message ?? "").trim();
     logger.error({ videoId, stderr: fullStderr.slice(0, 400) }, "yt-dlp failed");
   }
 
   for (const ext of exts) {
-    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+    const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
       const { statSync } = await import("node:fs");
-      if (statSync(p).size > 1000) return p;
+      if (statSync(p).size > 1000) { rawPath = p; break; }
     }
   }
 
-  if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests"))
-    throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (fullStderr.includes("Sign in") || fullStderr.includes("bot"))
-    throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  throw new Error("فشل التحميل: " + (fullStderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  if (!rawPath) {
+    if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests")) {
+      throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
+    }
+    if (fullStderr.includes("Sign in") || fullStderr.includes("bot")) {
+      throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
+    }
+    throw new Error("فشل التحميل: " + fullStderr.slice(0, 300));
+  }
+
+  if (rawPath === mp3Path) return mp3Path;
+
+  // Convert to mp3 with ffmpeg
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path,
+    ], { stdio: "pipe" });
+    let ffErr = "";
+    ff.stderr?.on("data", (d: Buffer) => { ffErr += d.toString(); });
+    ff.on("close", code => {
+      if (code === 0 && existsSync(mp3Path)) resolve();
+      else reject(new Error(`ffmpeg (${code}): ${ffErr.slice(-200)}`));
+    });
+    ff.on("error", reject);
+    setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 120_000);
+  });
+
+  await unlink(rawPath).catch(() => {});
+  return mp3Path;
 }
 
-// ── Get direct stream URL (fast path — no disk write) ────────────────────
-async function getDirectUrl(videoId: string): Promise<string | null> {
-  const nodeBin = process.execPath;
-  try {
-    const { stdout } = await execFileAsync(YT_DLP_BIN, [
-      `https://www.youtube.com/watch?v=${videoId}`,
-      "-g", "--format", "bestaudio/best",
-      "--no-playlist", "--socket-timeout", "20",
-      "--no-check-certificates",
-      "--js-runtimes", `node:${nodeBin}`,
-      ...cookieArgs(),
-    ], { timeout: 30_000 });
-    const url = stdout.trim().split("\n")[0]?.trim();
-    return url && url.startsWith("http") ? url : null;
-  } catch { return null; }
-}
-
-// ── Send audio ────────────────────────────────────────────────────────────
+// ── Send audio (cache-aware) ──────────────────────────────────────────────
 async function sendAudio(
   chatId: number,
   video: Pick<VideoResult, "id" | "title" | "uploader" | "duration">,
   api: Bot["api"],
   statusMsgId?: number,
 ): Promise<void> {
-  // 1. file_id cache — instant
   const cached = fileIdCache.get(video.id);
   if (cached) {
     if (statusMsgId) await api.deleteMessage(chatId, statusMsgId).catch(() => {});
@@ -215,50 +221,19 @@ async function sendAudio(
     return;
   }
 
-  // Show download message immediately
   let dlMsgId = statusMsgId;
   if (!dlMsgId) {
-    dlMsgId = (await api.sendMessage(chatId, `⬇️ ${video.title}`)).message_id;
+    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل… ${video.title}`)).message_id;
   } else {
-    await safeEdit(api, chatId, dlMsgId, `⬇️ ${video.title}`);
+    await safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
   }
 
   let filePath: string | undefined;
   try {
-    // 2. Try streaming via direct URL first (fastest — no disk I/O wait)
-    const directUrl = await getDirectUrl(video.id);
-    if (directUrl) {
-      const https = await import("node:https");
-      const http  = await import("node:http");
-      const lib   = directUrl.startsWith("https") ? https : http;
-
-      const streamSent = await new Promise<boolean>((resolve) => {
-        lib.get(directUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, async (res) => {
-          if (res.statusCode !== 200) { res.resume(); resolve(false); return; }
-          try {
-            const sent = await api.sendAudio(
-              chatId,
-              new InputFile(res, `${video.title.slice(0, 50)}.m4a`),
-              { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
-                caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
-            );
-            if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
-            resolve(true);
-          } catch { resolve(false); }
-        }).on("error", () => resolve(false));
-      });
-
-      if (streamSent) {
-        await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
-        return;
-      }
-    }
-
-    // 3. Fallback: download to disk then upload
     filePath = await downloadAudio(video.id);
     const sent = await api.sendAudio(
       chatId,
-      new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.m4a`),
+      new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.mp3`),
       { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
         caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
     );
