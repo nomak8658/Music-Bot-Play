@@ -135,7 +135,7 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   }));
 }
 
-// ── In-progress downloads map (prevents duplicate parallel downloads) ───────
+// ── In-progress downloads map ────────────────────────────────────────────
 const downloadingNow = new Map<string, Promise<string>>();
 
 function downloadAudio(videoId: string): Promise<string> {
@@ -163,51 +163,58 @@ async function _doDownload(videoId: string): Promise<string> {
   const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
   const nodeBin = process.execPath;
 
-  const args = [
-    ytUrl,
-    "--format", "bestaudio/best",
-    "-o", outTpl,
-    "--no-playlist",
-    "--socket-timeout", "15",
-    "--no-check-certificates",
-    "--no-warnings",
-    "--geo-bypass",
-    "--geo-bypass-country", "SA",
-    "--js-runtimes", `node:${nodeBin}`,
-    "--retries", "3",
-    "--fragment-retries", "3",
-    "--no-write-thumbnail",
-    "--no-write-info-json",
-    // Fix 403: use web player client + proper headers
-    ...cookieArgs(),
-  ];
+  // Try multiple player clients — each generates different CDN URLs
+  // tv_embedded and mweb generate IP-unrestricted URLs (no PO token needed)
+  const clients = ["tv_embedded", "mweb", "ios"];
 
-  let stderr = "";
-  try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 60_000 });
-  } catch (err: unknown) {
-    const e = err as { stderr?: string; message?: string };
-    stderr = (e.stderr ?? e.message ?? "").trim();
-    logger.error({ videoId, stderr: stderr.slice(0, 400) }, "yt-dlp error");
+  for (const client of clients) {
+    // Clean up partial files
+    for (const ext of exts) {
+      const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+      if (existsSync(p)) try { (await import("node:fs")).unlinkSync(p); } catch {/**/}
+    }
+
+    const args = [
+      ytUrl,
+      "--format", "bestaudio/best",
+      "-o", outTpl,
+      "--no-playlist",
+      "--socket-timeout", "20",
+      "--no-check-certificates",
+      "--no-warnings",
+      "--geo-bypass",
+      "--geo-bypass-country", "SA",
+      "--extractor-args", `youtube:player_client=${client}`,
+      "--js-runtimes", `node:${nodeBin}`,
+      "--retries", "2",
+      "--fragment-retries", "2",
+      "--no-write-thumbnail",
+      "--no-write-info-json",
+      ...cookieArgs(),
+    ];
+
+    let stderr = "";
+    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 50_000 }); }
+    catch (err: unknown) {
+      const e = err as { stderr?: string; message?: string };
+      stderr = (e.stderr ?? e.message ?? "").trim();
+    }
+
+    const { readdirSync, statSync } = await import("node:fs");
+    const files = readdirSync(cacheDir).filter(fn =>
+      fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
+    );
+    for (const file of files) {
+      const p = join(cacheDir, file);
+      if (statSync(p).size > 1000) {
+        logger.info({ videoId, client }, "download ok");
+        return p;
+      }
+    }
+    logger.warn({ videoId, client, err: stderr.slice(0, 120) }, "client failed, trying next");
   }
 
-  // Use glob-style search to find ANY downloaded file for this videoId
-  const { readdirSync, statSync } = await import("node:fs");
-  const files = readdirSync(cacheDir).filter(f =>
-    f.startsWith(`tgbot_${videoId}.`) && !f.endsWith(".part")
-  );
-  for (const file of files) {
-    const p = join(cacheDir, file);
-    if (statSync(p).size > 1000) { logger.info({ videoId, file }, "download ok"); return p; }
-  }
-
-  if (stderr.includes("429") || stderr.includes("Too Many Requests"))
-    throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-  if (stderr.includes("Sign in") || stderr.includes("bot") || stderr.includes("cookie"))
-    throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-  if (stderr.includes("not available") || stderr.includes("This video is unavailable"))
-    throw new Error("⚠️ هذا الفيديو غير متاح — جرّب أغنية أخرى");
-  throw new Error("فشل التحميل: " + (stderr.slice(0, 300) || "لم ينشأ أي ملف"));
+  throw new Error("فشل التحميل من YouTube — جرّب أغنية ثانية أو انتظر دقائق");
 }
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
