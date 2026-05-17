@@ -148,6 +148,7 @@ async function downloadAudio(videoId: string): Promise<string> {
     "--retries", "2",
     "--fragment-retries", "2",
     "--no-warnings",
+    "--geo-bypass",
     ...cookieArgs(),
   ];
 
