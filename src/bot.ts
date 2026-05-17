@@ -130,12 +130,24 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   }));
 }
 
+// ── In-progress downloads map (prevents duplicate parallel downloads) ───────
+const downloadingNow = new Map<string, Promise<string>>();
+
 // ── Download audio ────────────────────────────────────────────────────────
-async function downloadAudio(videoId: string): Promise<string> {
+function downloadAudio(videoId: string): Promise<string> {
+  // If already downloading this video, reuse the same promise
+  const existing = downloadingNow.get(videoId);
+  if (existing) return existing;
+
+  const promise = _doDownload(videoId).finally(() => downloadingNow.delete(videoId));
+  downloadingNow.set(videoId, promise);
+  return promise;
+}
+
+async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
 
-  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -148,58 +160,50 @@ async function downloadAudio(videoId: string): Promise<string> {
   const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
   const nodeBin = process.execPath;
 
-  // Base flags shared by all attempts
   const base = [
     "--format", "bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
-    "--socket-timeout", "20",
+    "--socket-timeout", "15",
     "--no-check-certificates",
     "--no-warnings",
     "--geo-bypass",
-    "--retries", "2",
-    "--fragment-retries", "2",
+    "--retries", "1",
+    "--fragment-retries", "1",
     "--no-write-thumbnail",
     "--no-write-info-json",
     ...cookieArgs(),
   ];
 
-  // Try multiple strategies — some videos need specific player clients
-  const strategies = [
-    // 1. Default with node JS runtime (handles most videos)
-    [...base, "--js-runtimes", `node:${nodeBin}`],
-    // 2. mweb client — no JS needed, works on cloud IPs
-    [...base, "--extractor-args", "youtube:player_client=mweb"],
-    // 3. Plain — no extra args (last resort)
-    [...base],
+  const strategies: Array<[string, string[]]> = [
+    ["js-runtime",  [...base, "--js-runtimes", `node:${nodeBin}`]],
+    ["mweb-client", [...base, "--extractor-args", "youtube:player_client=mweb"]],
+    ["plain",       [...base]],
   ];
 
   let lastStderr = "";
 
-  for (const args of strategies) {
-    // Clean up partial files from previous attempt
+  for (const [name, args] of strategies) {
+    // Clean partial files
     for (const ext of exts) {
       const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
       if (existsSync(p)) try { (await import("node:fs")).unlinkSync(p); } catch {/**/}
     }
 
-    try { await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 60_000 }); }
+    try { await execFileAsync(YT_DLP_BIN, [ytUrl, ...args], { timeout: 35_000 }); }
     catch (err: unknown) {
       const e = err as { stderr?: string; message?: string };
       lastStderr = (e.stderr ?? e.message ?? "").trim();
+      logger.warn({ videoId, strategy: name, err: lastStderr.slice(0, 100) }, "strategy failed");
     }
 
     for (const ext of exts) {
       const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
       if (existsSync(p)) {
         const { statSync } = await import("node:fs");
-        if (statSync(p).size > 1000) {
-          logger.info({ videoId, strategy: args.find(a => a.includes("player_client") || a.includes("js-runtimes")) ?? "default" }, "download ok");
-          return p;
-        }
+        if (statSync(p).size > 1000) { logger.info({ videoId, strategy: name }, "ok"); return p; }
       }
     }
-    logger.warn({ videoId, stderr: lastStderr.slice(0, 120) }, "strategy failed, trying next");
   }
 
   if (lastStderr.includes("429") || lastStderr.includes("Too Many Requests"))
