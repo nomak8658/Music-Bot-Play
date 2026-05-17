@@ -179,7 +179,7 @@ async function _doDownload(videoId: string): Promise<string> {
     "--no-write-thumbnail",
     "--no-write-info-json",
     // Fix 403: use web player client + proper headers
-    "--extractor-args", "youtube:player_client=web,mweb",
+    "--extractor-args", "youtube:player_client=mweb",
     "--add-header", "Origin:https://www.youtube.com",
     "--add-header", "Referer:https://www.youtube.com/",
     "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
