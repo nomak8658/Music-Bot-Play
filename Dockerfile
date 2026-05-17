@@ -2,7 +2,7 @@ FROM node:22-slim
 
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv python3-full \
-    ffmpeg gcc curl \
+    ffmpeg gcc curl aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Always get the latest yt-dlp binary directly from GitHub releases
