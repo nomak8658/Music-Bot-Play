@@ -141,9 +141,20 @@ function downloadAudio(videoId: string): Promise<string> {
   return promise;
 }
 
+function arabicError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes("not available"))          return "❌ الفيديو غير متاح أو محذوف";
+  if (r.includes("private video"))          return "❌ الفيديو خاص ولا يمكن تحميله";
+  if (r.includes("sign in") || r.includes("age")) return "❌ الفيديو مقيّد بالعمر";
+  if (r.includes("copyright") || r.includes("blocked")) return "❌ الفيديو محظور في منطقتنا";
+  if (r.includes("abort") || r.includes("timeout")) return "❌ انتهت مهلة التحميل، جرب مرة ثانية";
+  if (r.includes("spawn failed"))           return "❌ خطأ داخلي في الخادم";
+  return `❌ فشل التحميل: ${raw.slice(0, 120)}`;
+}
+
 async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
-  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
+  const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
@@ -153,12 +164,12 @@ async function _doDownload(videoId: string): Promise<string> {
     }
   }
 
-  // Use Replit proxy — Replit's IP is not blocked by YouTube CDN
+  // Use Replit proxy — Replit IP not blocked by YouTube; Replit converts to mp3 ≤47 MB
   const proxyUrl = `https://0ba9cc3f-9ac7-4850-8935-6f7c47681769-00-29a83w15noc7w.picard.replit.dev/api/dl/${videoId}`;
-  let fetchErr = "";
+  let rawErr = "";
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 110_000);
+    const timer = setTimeout(() => controller.abort(), 120_000);
     const res = await fetch(proxyUrl, { signal: controller.signal });
     clearTimeout(timer);
 
@@ -173,19 +184,22 @@ async function _doDownload(videoId: string): Promise<string> {
         logger.info({ videoId, bytes: buf.byteLength }, "proxy download ok");
         return outPath;
       }
-      fetchErr = `empty audio (${buf.byteLength} bytes)`;
+      rawErr = `empty audio (${buf.byteLength} bytes)`;
     } else {
       const errBody = await res.text().catch(() => "");
-      let detail = errBody.slice(0, 150);
-      try { detail = JSON.parse(errBody).detail ?? JSON.parse(errBody).error ?? detail; } catch {}
-      fetchErr = `HTTP ${res.status}: ${detail}`;
+      let detail = errBody.slice(0, 200);
+      try {
+        const j = JSON.parse(errBody);
+        detail = j.detail ?? j.error ?? detail;
+      } catch {}
+      rawErr = detail;
     }
   } catch (err) {
-    fetchErr = String(err).slice(0, 150);
+    rawErr = String(err);
   }
 
-  logger.error({ videoId, fetchErr }, "proxy failed");
-  throw new Error(`فشل التحميل — الخادم غير متاح (${fetchErr})`);
+  logger.error({ videoId, rawErr }, "proxy failed");
+  throw new Error(arabicError(rawErr));
 }
 
 
