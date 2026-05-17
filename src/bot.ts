@@ -156,21 +156,17 @@ async function _doDownload(videoId: string): Promise<string> {
 
   const outTpl  = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
   const ytUrl   = `https://www.youtube.com/watch?v=${videoId}`;
-  const nodeBin = process.execPath;
-
   const args = [
     ytUrl,
     "--format", "bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
-    "--socket-timeout", "15",
+    "--socket-timeout", "20",
     "--no-check-certificates",
     "--no-warnings",
-    "--geo-bypass",
-    "--geo-bypass-country", "SA",
-    "--js-runtimes", `node:${nodeBin}`,
-    "--retries", "2",
-    "--fragment-retries", "2",
+    "--extractor-args", "youtube:player_client=android_testsuite,ios,mweb",
+    "--retries", "3",
+    "--fragment-retries", "3",
     "--no-write-thumbnail",
     "--no-write-info-json",
     ...cookieArgs(),
