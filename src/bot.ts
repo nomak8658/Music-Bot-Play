@@ -7,6 +7,11 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "./lib/logger";
+import {
+  loadChallenge, startChallenge, stopChallenge,
+  sendStatus, countMessage, isActive, getChatId,
+  resumeIfActive,
+} from "./challenge";
 import { voiceManager } from "./voice_manager";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -268,6 +273,10 @@ bot.command("start", ctx => ctx.reply(
   "`بحث [أغنية]` — بحث واختيار\n" +
   "`شغل [أغنية]` — تشغيل في مكالمة صوتية\n" +
   "`قائمة` · `التالي` · `وقف`\n\n" +
+  "🏆 *التحدي اليومي:*\n" +
+  "`تحدي ابدأ` — يبدأ التحدي (أدمن)\n" +
+  "`تحدي` — حالة التحدي والمتصدّرون\n" +
+  "`تحدي وقف` — يوقف التحدي (أدمن)\n\n" +
   "💡 `@البوت اسم_الأغنية` في أي محادثة",
   { parse_mode: "Markdown" },
 ));
@@ -319,6 +328,13 @@ bot.command("qr", async ctx => {
 bot.on("message:text", async ctx => {
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
+
+  // Track messages for active challenge
+  if (isActive() && getChatId() === chatId && ctx.from) {
+    const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ")
+      || ctx.from.username || String(ctx.from.id);
+    countMessage(String(ctx.from.id), name);
+  }
 
   if (/^(يوت|يوتيوب)\s+/u.test(text)) {
     const query = text.replace(/^(يوت|يوتيوب)\s+/u, "").trim();
@@ -378,6 +394,38 @@ bot.on("message:text", async ctx => {
     } catch (err) {
       await safeEdit(ctx.api, chatId, msg.message_id, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ"}`);
     }
+    return;
+  }
+
+  // ── Challenge commands ──────────────────────────────────────────────────
+  if (text === "تحدي ابدأ" || text.startsWith("تحدي ابدأ ")) {
+    // Admin check
+    const member = await ctx.api.getChatMember(chatId, ctx.from!.id).catch(() => null);
+    if (!member || !["administrator","creator"].includes(member.status)) {
+      await ctx.reply("❌ فقط الأدمن يقدر يبدأ التحدي.");
+      return;
+    }
+    // Parse optional args: تحدي ابدأ [هدف] [زيادة] [ساعات]
+    const parts = text.split(/\s+/);
+    const base  = parseInt(parts[2] ?? "900", 10)  || 900;
+    const step  = parseInt(parts[3] ?? "100", 10)  || 100;
+    const hours = parseInt(parts[4] ?? "24",  10)  || 24;
+    await startChallenge(chatId, ctx.api, { baseTarget: base, stepPerDay: step, dayHours: hours });
+    return;
+  }
+
+  if (text === "تحدي وقف") {
+    const member = await ctx.api.getChatMember(chatId, ctx.from!.id).catch(() => null);
+    if (!member || !["administrator","creator"].includes(member.status)) {
+      await ctx.reply("❌ فقط الأدمن يقدر يوقف التحدي.");
+      return;
+    }
+    await stopChallenge(ctx.api);
+    return;
+  }
+
+  if (text === "تحدي" || text === "تحدي حالة") {
+    await sendStatus(ctx.api);
     return;
   }
 
@@ -458,6 +506,7 @@ export async function startBot() {
     logger.info({ username: BOT_USERNAME }, "Bot username");
   } catch { /* use default */ }
   await loadCache();
+  await loadChallenge();
   voiceManager.start();
   voiceManager.once("ready", async () => {
     logger.info("VoiceService ready");
@@ -475,6 +524,7 @@ export async function startBot() {
       await notifyAll(`❌ خطأ QR: ${String(msg["error"])}`);
     }
   });
+  resumeIfActive(bot.api);
   bot.start({ onStart: () => logger.info("Bot polling started") })
     .catch(err => logger.error({ err }, "Bot crashed"));
   process.once("SIGINT", () => bot.stop());
