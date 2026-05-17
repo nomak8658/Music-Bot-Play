@@ -171,7 +171,7 @@ async function _doDownload(videoId: string): Promise<string> {
 
     const args = [
       ytUrl,
-      "--format", "bestaudio/best",
+      "--format", "140/251/250/249/bestaudio/18/best",
       "-o", outTpl,
       "--no-playlist",
       "--socket-timeout", "20",
