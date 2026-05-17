@@ -142,14 +142,11 @@ function downloadAudio(videoId: string): Promise<string> {
 }
 
 function arabicError(raw: string): string {
+  // If proxy already sent Arabic (starts with ❌), show as-is
+  if (raw.startsWith("❌")) return raw;
   const r = raw.toLowerCase();
-  if (r.includes("not available"))          return "❌ الفيديو غير متاح أو محذوف";
-  if (r.includes("private video"))          return "❌ الفيديو خاص ولا يمكن تحميله";
-  if (r.includes("sign in") || r.includes("age")) return "❌ الفيديو مقيّد بالعمر";
-  if (r.includes("copyright") || r.includes("blocked")) return "❌ الفيديو محظور في منطقتنا";
-  if (r.includes("abort") || r.includes("timeout")) return "❌ انتهت مهلة التحميل، جرب مرة ثانية";
-  if (r.includes("too long") || r.includes("video too long") || r.includes("دقيقة")) return "❌ الفيديو طويل جداً — الحد الأقصى 15 دقيقة للأغاني";
-  if (r.includes("spawn failed"))           return "❌ خطأ داخلي في الخادم";
+  if (r.includes("abort") || r.includes("timeout")) return "❌ انتهت مهلة التحميل — جرّب مرة ثانية";
+  if (r.includes("fetch"))   return "❌ تعذّر الوصول لخادم التحميل";
   return `❌ فشل التحميل: ${raw.slice(0, 120)}`;
 }
 
@@ -191,10 +188,10 @@ async function _doDownload(videoId: string): Promise<string> {
       let detail = errBody.slice(0, 200);
       try {
         const j = JSON.parse(errBody);
-        detail = j.detail ?? j.error ?? detail;
+        // proxy now returns Arabic messages directly in `error` field
+        detail = j.error ?? j.detail ?? detail;
       } catch {}
-      if (res.status === 422) rawErr = detail; // video too long — already Arabic
-      else rawErr = detail;
+      rawErr = detail;
     }
   } catch (err) {
     rawErr = String(err);
