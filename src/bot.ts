@@ -148,6 +148,7 @@ function arabicError(raw: string): string {
   if (r.includes("sign in") || r.includes("age")) return "❌ الفيديو مقيّد بالعمر";
   if (r.includes("copyright") || r.includes("blocked")) return "❌ الفيديو محظور في منطقتنا";
   if (r.includes("abort") || r.includes("timeout")) return "❌ انتهت مهلة التحميل، جرب مرة ثانية";
+  if (r.includes("too long") || r.includes("video too long") || r.includes("دقيقة")) return "❌ الفيديو طويل جداً — الحد الأقصى 15 دقيقة للأغاني";
   if (r.includes("spawn failed"))           return "❌ خطأ داخلي في الخادم";
   return `❌ فشل التحميل: ${raw.slice(0, 120)}`;
 }
@@ -192,7 +193,8 @@ async function _doDownload(videoId: string): Promise<string> {
         const j = JSON.parse(errBody);
         detail = j.detail ?? j.error ?? detail;
       } catch {}
-      rawErr = detail;
+      if (res.status === 422) rawErr = detail; // video too long — already Arabic
+      else rawErr = detail;
     }
   } catch (err) {
     rawErr = String(err);
