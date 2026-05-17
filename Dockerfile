@@ -20,7 +20,7 @@ RUN node build.mjs
 
 RUN python3 -m venv .venv && \
     .venv/bin/pip install --upgrade pip && \
-    .venv/bin/pip install pyrogram tgcrypto py-tgcalls
+    .venv/bin/pip install telethon pytgcalls tgcrypto
 
 EXPOSE 8080
 CMD ["node", "dist/index.mjs"]
