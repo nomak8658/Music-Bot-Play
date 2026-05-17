@@ -145,7 +145,6 @@ async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
   const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4", "mkv"];
 
-  // Return cached file instantly
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
@@ -156,54 +155,45 @@ async function _doDownload(videoId: string): Promise<string> {
 
   const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // ── Strategy 1: cobalt.tools API (no IP restriction, no PO token needed) ──
-  const cobaltHosts = [
-    "https://co.wuk.sh",
-    "https://cobalt.api.timelessnesses.me",
-    "https://cobalt.tools",
-  ];
-  for (const host of cobaltHosts) {
-    try {
-      const res = await fetch(`${host}/api/json`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-        },
-        body: JSON.stringify({
-          url: ytUrl,
-          isAudioOnly: true,
-          aFormat: "best",
-          isNoTTWatermark: true,
-        }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!res.ok) { logger.warn({ host, status: res.status }, "cobalt non-ok"); continue; }
-      const data = await res.json() as { status: string; url?: string };
-      if ((data.status === "redirect" || data.status === "stream" || data.status === "tunnel") && data.url) {
-        // Download the audio
-        const dlRes = await fetch(data.url, { signal: AbortSignal.timeout(60_000) });
-        if (!dlRes.ok) continue;
+  // ── Strategy 1: cobalt.tools new API (v10+) ────────────────────────────────
+  try {
+    const res = await fetch("https://api.cobalt.tools/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+      },
+      body: JSON.stringify({
+        url: ytUrl,
+        downloadMode: "audio",
+        audioFormat: "best",
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const data = await res.json() as { status: string; url?: string; error?: unknown };
+    logger.info({ videoId, cobaltStatus: data.status, cobaltUrl: data.url?.slice(0,60) }, "cobalt response");
+    if (data.url && (data.status === "redirect" || data.status === "tunnel" || data.status === "stream")) {
+      const dlRes = await fetch(data.url, { signal: AbortSignal.timeout(90_000) });
+      if (dlRes.ok) {
         const ct = dlRes.headers.get("content-type") ?? "";
         const ext = ct.includes("webm") || ct.includes("opus") ? "webm" : "m4a";
         const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
         const { createWriteStream } = await import("node:fs");
         const { Readable } = await import("node:stream");
         const { finished } = await import("node:stream/promises");
-        const writer = createWriteStream(outPath);
-        await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(writer));
+        await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(createWriteStream(outPath)));
         const { statSync } = await import("node:fs");
         if (statSync(outPath).size > 1000) {
-          logger.info({ videoId, host }, "cobalt download ok");
+          logger.info({ videoId }, "cobalt download ok");
           return outPath;
         }
       }
-    } catch (err) {
-      logger.warn({ videoId, host, err: String(err).slice(0, 100) }, "cobalt instance failed");
     }
+  } catch (err) {
+    logger.warn({ videoId, err: String(err).slice(0, 150) }, "cobalt failed");
   }
 
-  // ── Strategy 2: yt-dlp with multiple clients ───────────────────────────────
+  // ── Strategy 2: yt-dlp with ios/mweb clients ───────────────────────────────
   const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
   for (const client of ["ios", "mweb", "android"]) {
     const args = [
@@ -215,23 +205,24 @@ async function _doDownload(videoId: string): Promise<string> {
       "--no-check-certificates",
       "--no-warnings",
       "--extractor-args", `youtube:player_client=${client}`,
+      "--geo-bypass",
       "--retries", "2",
       "--fragment-retries", "2",
       "--no-write-thumbnail",
       "--no-write-info-json",
       ...cookieArgs(),
     ];
-    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); } catch {/**/}
+    let stderr = "";
+    try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); }
+    catch (e: unknown) { stderr = ((e as {stderr?:string}).stderr ?? String(e)).slice(0,200); }
+    logger.info({ videoId, client, stderr }, "yt-dlp attempt");
     const { readdirSync, statSync } = await import("node:fs");
     const files = readdirSync(cacheDir).filter(fn =>
       fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
     );
     for (const file of files) {
       const p = join(cacheDir, file);
-      if (statSync(p).size > 1000) {
-        logger.info({ videoId, client }, "yt-dlp fallback ok");
-        return p;
-      }
+      if (statSync(p).size > 1000) { logger.info({ videoId, client }, "yt-dlp ok"); return p; }
     }
   }
 
