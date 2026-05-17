@@ -138,20 +138,16 @@ async function downloadAudio(videoId: string): Promise<string> {
   const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
   const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
-  // Find node binary for yt-dlp JS extraction (critical for YouTube formats)
-  const nodeBin = process.execPath; // always correct in Node.js runtime
-
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
     "-x", "--audio-format", "mp3", "--audio-quality", "0",
     "-o", outTpl,
     "--no-playlist",
-    "--socket-timeout", "30",
+    "--socket-timeout", "20",
     "--no-check-certificates",
-    "--js-runtimes", `node:${nodeBin}`,   // fix: tell yt-dlp where node is
-    "--retries", "5",                      // retry on 429
-    "--retry-sleep", "exp=1:30:2",         // exponential backoff up to 30s
-    "--fragment-retries", "5",
+    "--retries", "2",
+    "--fragment-retries", "2",
+    "--no-warnings",
     ...cookieArgs(),
   ];
 
@@ -159,7 +155,7 @@ async function downloadAudio(videoId: string): Promise<string> {
   let fullStderr = "";
 
   try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 300_000 });
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 90_000 });
   } catch (err: unknown) {
     const e = err as { stderr?: string; stdout?: string; message?: string };
     fullStderr = (e.stderr ?? e.message ?? "").trim();
