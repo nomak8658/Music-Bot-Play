@@ -154,58 +154,57 @@ async function _doDownload(videoId: string): Promise<string> {
     }
   }
 
-  // ── Strategy 1: Invidious API (bypasses YouTube CDN IP restrictions) ───────
-  const invidiousInstances = [
-    "https://invidious.nerdvpn.de",
-    "https://inv.riverside.rocks",
-    "https://yt.artemislena.eu",
-    "https://invidious.slipfox.xyz",
-    "https://iv.datura.network",
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // ── Strategy 1: cobalt.tools API (no IP restriction, no PO token needed) ──
+  const cobaltHosts = [
+    "https://co.wuk.sh",
+    "https://cobalt.api.timelessnesses.me",
+    "https://cobalt.tools",
   ];
-
-  for (const host of invidiousInstances) {
+  for (const host of cobaltHosts) {
     try {
-      const infoUrl = `${host}/api/v1/videos/${videoId}?fields=adaptiveFormats,formatStreams`;
-      const res = await fetch(infoUrl, { signal: AbortSignal.timeout(10_000) });
-      if (!res.ok) continue;
-      const info = await res.json() as {
-        adaptiveFormats?: { itag: number; type: string; url: string; bitrate?: number }[];
-        formatStreams?: { itag: number; type: string; url: string }[];
-      };
-
-      // Pick best audio-only format (prefer m4a/140, then webm/opus/251)
-      const audioFmts = (info.adaptiveFormats ?? []).filter(f => f.type.startsWith("audio/"));
-      audioFmts.sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-      const fmt = audioFmts[0] ?? (info.formatStreams ?? [])[0];
-      if (!fmt?.url) continue;
-
-      const ext = fmt.type.includes("mp4") || fmt.type.includes("m4a") ? "m4a" : "webm";
-      const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
-
-      // Download via Invidious proxy URL (no IP restriction)
-      const dlRes = await fetch(fmt.url, { signal: AbortSignal.timeout(60_000) });
-      if (!dlRes.ok) continue;
-
-      const { createWriteStream } = await import("node:fs");
-      const { Readable } = await import("node:stream");
-      const { finished } = await import("node:stream/promises");
-      const writer = createWriteStream(outPath);
-      await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(writer));
-
-      const { statSync } = await import("node:fs");
-      if (statSync(outPath).size > 1000) {
-        logger.info({ videoId, host, ext }, "invidious download ok");
-        return outPath;
+      const res = await fetch(`${host}/api/json`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+        },
+        body: JSON.stringify({
+          url: ytUrl,
+          isAudioOnly: true,
+          aFormat: "best",
+          isNoTTWatermark: true,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) { logger.warn({ host, status: res.status }, "cobalt non-ok"); continue; }
+      const data = await res.json() as { status: string; url?: string };
+      if ((data.status === "redirect" || data.status === "stream" || data.status === "tunnel") && data.url) {
+        // Download the audio
+        const dlRes = await fetch(data.url, { signal: AbortSignal.timeout(60_000) });
+        if (!dlRes.ok) continue;
+        const ct = dlRes.headers.get("content-type") ?? "";
+        const ext = ct.includes("webm") || ct.includes("opus") ? "webm" : "m4a";
+        const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
+        const { createWriteStream } = await import("node:fs");
+        const { Readable } = await import("node:stream");
+        const { finished } = await import("node:stream/promises");
+        const writer = createWriteStream(outPath);
+        await finished(Readable.fromWeb(dlRes.body as import("stream/web").ReadableStream).pipe(writer));
+        const { statSync } = await import("node:fs");
+        if (statSync(outPath).size > 1000) {
+          logger.info({ videoId, host }, "cobalt download ok");
+          return outPath;
+        }
       }
     } catch (err) {
-      logger.warn({ videoId, host, err: String(err).slice(0, 80) }, "invidious instance failed");
+      logger.warn({ videoId, host, err: String(err).slice(0, 100) }, "cobalt instance failed");
     }
   }
 
-  // ── Strategy 2: yt-dlp fallback (might work with cookies) ─────────────────
+  // ── Strategy 2: yt-dlp with multiple clients ───────────────────────────────
   const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
-  const ytUrl  = `https://www.youtube.com/watch?v=${videoId}`;
-
   for (const client of ["ios", "mweb", "android"]) {
     const args = [
       ytUrl,
@@ -222,10 +221,8 @@ async function _doDownload(videoId: string): Promise<string> {
       "--no-write-info-json",
       ...cookieArgs(),
     ];
-
     try { await execFileAsync(YT_DLP_BIN, args, { timeout: 55_000 }); } catch {/**/}
-
-    const { readdirSync, statSync, unlinkSync } = await import("node:fs");
+    const { readdirSync, statSync } = await import("node:fs");
     const files = readdirSync(cacheDir).filter(fn =>
       fn.startsWith(`tgbot_${videoId}.`) && !fn.endsWith(".part")
     );
