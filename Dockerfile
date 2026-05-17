@@ -20,8 +20,7 @@ RUN node build.mjs
 
 RUN python3 -m venv .venv && \
     .venv/bin/pip install --upgrade pip && \
-    .venv/bin/pip install telethon tgcrypto && \
-    .venv/bin/pip install "pytgcalls>=3.0.0" || echo "pytgcalls install failed — voice calls disabled"
+    .venv/bin/pip install pyrogram tgcrypto py-tgcalls
 
 EXPOSE 8080
 CMD ["node", "dist/index.mjs"]
