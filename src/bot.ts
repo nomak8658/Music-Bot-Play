@@ -131,75 +131,66 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
 }
 
 // ── Download audio ────────────────────────────────────────────────────────
+// Downloads best audio directly — no ffmpeg re-encoding (saves 2-4s)
 async function downloadAudio(videoId: string): Promise<string> {
-  const mp3Path = join(tmpdir(), `tgbot_${videoId}.mp3`);
-  if (existsSync(mp3Path)) return mp3Path;
+  const cacheDir = tmpdir();
+  // Preferred formats Telegram plays natively (no conversion needed)
+  const exts = ["m4a", "webm", "opus", "ogg", "mp3", "mp4"];
 
-  const outTpl = join(tmpdir(), `tgbot_${videoId}.%(ext)s`);
-  const exts   = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
+  // Return cached file if exists
+  for (const ext of exts) {
+    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+    if (existsSync(p)) {
+      const { statSync } = await import("node:fs");
+      if (statSync(p).size > 1000) return p;
+    }
+  }
+
+  const outTpl = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
 
   const args = [
     `https://www.youtube.com/watch?v=${videoId}`,
-    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+    // Best audio without re-encoding — m4a preferred (Telegram plays natively)
+    "--format", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
     "-o", outTpl,
     "--no-playlist",
     "--socket-timeout", "20",
     "--no-check-certificates",
-    "--retries", "2",
-    "--fragment-retries", "2",
     "--no-warnings",
     "--geo-bypass",
+    "--retries", "2",
+    "--fragment-retries", "2",
+    // Skip unused metadata to speed up extraction
+    "--no-write-thumbnail",
+    "--no-write-info-json",
+    "--no-write-comments",
     ...cookieArgs(),
   ];
 
-  let rawPath: string | undefined;
   let fullStderr = "";
-
   try {
     await execFileAsync(YT_DLP_BIN, args, { timeout: 90_000 });
   } catch (err: unknown) {
-    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const e = err as { stderr?: string; message?: string };
     fullStderr = (e.stderr ?? e.message ?? "").trim();
     logger.error({ videoId, stderr: fullStderr.slice(0, 400) }, "yt-dlp failed");
   }
 
   for (const ext of exts) {
-    const p = join(tmpdir(), `tgbot_${videoId}.${ext}`);
+    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
       const { statSync } = await import("node:fs");
-      if (statSync(p).size > 1000) { rawPath = p; break; }
+      if (statSync(p).size > 1000) return p;
     }
   }
 
-  if (!rawPath) {
-    if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests")) {
-      throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
-    }
-    if (fullStderr.includes("Sign in") || fullStderr.includes("bot")) {
-      throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
-    }
-    throw new Error("فشل التحميل: " + fullStderr.slice(0, 300));
-  }
-
-  if (rawPath === mp3Path) return mp3Path;
-
-  // Convert to mp3 with ffmpeg
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-i", rawPath!, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", mp3Path,
-    ], { stdio: "pipe" });
-    let ffErr = "";
-    ff.stderr?.on("data", (d: Buffer) => { ffErr += d.toString(); });
-    ff.on("close", code => {
-      if (code === 0 && existsSync(mp3Path)) resolve();
-      else reject(new Error(`ffmpeg (${code}): ${ffErr.slice(-200)}`));
-    });
-    ff.on("error", reject);
-    setTimeout(() => { ff.kill(); reject(new Error("ffmpeg timeout")); }, 120_000);
-  });
-
-  await unlink(rawPath).catch(() => {});
-  return mp3Path;
+  if (fullStderr.includes("429") || fullStderr.includes("Too Many Requests"))
+    throw new Error("⏳ YouTube يطلب الانتظار — حاول بعد دقيقتين");
+  if (fullStderr.includes("not available") || fullStderr.includes("unavailable"))
+    throw new Error("⚠️ الفيديو غير متاح في منطقة السيرفر");
+  if (fullStderr.includes("Sign in") || fullStderr.includes("bot"))
+    throw new Error("🔐 YouTube يطلب تسجيل دخول — تأكد من YOUTUBE_COOKIES في Railway");
+  throw new Error("فشل التحميل: " + (fullStderr.slice(0, 300) || "لم ينشأ أي ملف"));
 }
 
 // ── Send audio (cache-aware) ──────────────────────────────────────────────
@@ -230,7 +221,7 @@ async function sendAudio(
     filePath = await downloadAudio(video.id);
     const sent = await api.sendAudio(
       chatId,
-      new InputFile(createReadStream(filePath), `${video.title.slice(0, 50)}.mp3`),
+      new InputFile(createReadStream(filePath), `audio.m4a`),
       { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
         caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
     );
