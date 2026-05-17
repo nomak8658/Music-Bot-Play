@@ -141,64 +141,61 @@ function downloadAudio(videoId: string): Promise<string> {
   return promise;
 }
 
-function arabicError(raw: string): string {
-  // If proxy already sent Arabic (starts with ❌), show as-is
-  if (raw.startsWith("❌")) return raw;
-  const r = raw.toLowerCase();
-  if (r.includes("abort") || r.includes("timeout")) return "❌ انتهت مهلة التحميل — جرّب مرة ثانية";
-  if (r.includes("fetch"))   return "❌ تعذّر الوصول لخادم التحميل";
-  return `❌ فشل التحميل: ${raw.slice(0, 120)}`;
-}
 
 async function _doDownload(videoId: string): Promise<string> {
   const cacheDir = tmpdir();
   const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
 
+  // Return cached file if exists
   for (const ext of exts) {
     const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
     if (existsSync(p)) {
-      const { statSync } = await import("node:fs");
-      if (statSync(p).size > 1000) return p;
+      logger.info({ videoId, ext }, "cache hit");
+      return p;
     }
   }
 
-  // Use Replit proxy — Replit IP not blocked by YouTube; Replit converts to mp3 ≤47 MB
-  const proxyUrl = `https://0ba9cc3f-9ac7-4850-8935-6f7c47681769-00-29a83w15noc7w.picard.replit.dev/api/dl/${videoId}`;
-  let rawErr = "";
+  // Download directly with yt-dlp (no Replit proxy needed)
+  const outTemplate = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+  const args = [
+    "--no-playlist",
+    "--extract-audio",
+    "--audio-format", "mp3",
+    "--audio-quality", "96K",
+    "--postprocessor-args", "ffmpeg:-t 900",
+    "--extractor-args", "youtube:player_client=android_vr,tv_embedded,ios",
+    "--geo-bypass",
+    "--no-warnings",
+    "-o", outTemplate,
+    url,
+  ];
+
+  if (COOKIE_PATH) args.splice(0, 0, "--cookies", COOKIE_PATH);
+
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 120_000);
-    const res = await fetch(proxyUrl, { signal: controller.signal });
-    clearTimeout(timer);
-
-    const ct = res.headers.get("content-type") ?? "";
-    if (res.ok && ct.includes("audio")) {
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength > 1000) {
-        const ext = ct.includes("mpeg") ? "mp3" : ct.includes("webm") ? "webm" : "m4a";
-        const outPath = join(cacheDir, `tgbot_${videoId}.${ext}`);
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(outPath, Buffer.from(buf));
-        logger.info({ videoId, bytes: buf.byteLength }, "proxy download ok");
-        return outPath;
-      }
-      rawErr = `empty audio (${buf.byteLength} bytes)`;
-    } else {
-      const errBody = await res.text().catch(() => "");
-      let detail = errBody.slice(0, 200);
-      try {
-        const j = JSON.parse(errBody);
-        // proxy now returns Arabic messages directly in `error` field
-        detail = j.error ?? j.detail ?? detail;
-      } catch {}
-      rawErr = detail;
-    }
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000 });
   } catch (err) {
-    rawErr = String(err);
+    const msg = String((err as { stderr?: string }).stderr ?? err).slice(0, 300);
+    logger.error({ videoId, msg }, "yt-dlp download failed");
+    if (msg.includes("Sign in") || msg.includes("bot"))
+      throw new Error("❌ يوتيوب يطلب تسجيل دخول — أضف YOUTUBE_COOKIES");
+    if (msg.includes("unavailable") || msg.includes("private"))
+      throw new Error("❌ الفيديو غير متاح أو خاص");
+    throw new Error(`❌ فشل التحميل — ${msg.slice(0, 150)}`);
   }
 
-  logger.error({ videoId, rawErr }, "proxy failed");
-  throw new Error(arabicError(rawErr));
+  // Find the downloaded file
+  for (const ext of exts) {
+    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
+    if (existsSync(p)) {
+      logger.info({ videoId, ext }, "download ok");
+      return p;
+    }
+  }
+
+  throw new Error("❌ فشل التحميل — الملف لم يُنشأ");
 }
 
 
