@@ -18,9 +18,10 @@ RUN npm install
 COPY . .
 RUN node build.mjs
 
+# Python deps: telethon + py-tgcalls (voice_service.py uses Telethon, NOT Pyrogram)
 RUN python3 -m venv .venv && \
     .venv/bin/pip install --upgrade pip && \
-    .venv/bin/pip install pyrogram tgcrypto py-tgcalls
+    .venv/bin/pip install telethon cryptg py-tgcalls
 
 EXPOSE 8080
 CMD ["node", "dist/index.mjs"]
