@@ -172,6 +172,28 @@ async def cmd_stop(chat_id: int):
         send({"ok": False, "error": str(e)})
 
 
+async def cmd_pause(chat_id: int):
+    try:
+        tgc = await get_calls()
+        await tgc.pause_stream(chat_id)
+        send({"ok": True, "event": "paused", "chat_id": chat_id})
+    except Exception as e:
+        sys.stderr.write(f"[pause] error: {type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        send({"ok": False, "error": str(e)})
+
+
+async def cmd_resume(chat_id: int):
+    try:
+        tgc = await get_calls()
+        await tgc.resume_stream(chat_id)
+        send({"ok": True, "event": "resumed", "chat_id": chat_id})
+    except Exception as e:
+        sys.stderr.write(f"[resume] error: {type(e).__name__}: {e}\n")
+        sys.stderr.flush()
+        send({"ok": False, "error": str(e)})
+
+
 async def cmd_skip(chat_id: int, audio_file: str):
     try:
         from pytgcalls.types import MediaStream
@@ -233,6 +255,10 @@ async def main():
                 asyncio.create_task(cmd_join_and_play(data["chat_id"], data["audio_file"]))
             elif cmd == "stop":
                 asyncio.create_task(cmd_stop(data["chat_id"]))
+            elif cmd == "pause":
+                asyncio.create_task(cmd_pause(data["chat_id"]))
+            elif cmd == "resume":
+                asyncio.create_task(cmd_resume(data["chat_id"]))
             elif cmd == "skip":
                 asyncio.create_task(cmd_skip(data["chat_id"], data["audio_file"]))
             else:
