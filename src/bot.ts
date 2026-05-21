@@ -484,8 +484,23 @@ bot.command("cookies", ctx => ctx.reply(
   { parse_mode: "Markdown" },
 ));
 
-// ── /qr ───────────────────────────────────────────────────────────────────
+// ── /qr ── owner-only ────────────────────────────────────────────────────
+const OWNER_USERNAMES = new Set(
+  (process.env.BOT_OWNER_USERNAMES ?? "g2n_e")
+    .split(",")
+    .map(s => s.trim().replace(/^@/, "").toLowerCase())
+    .filter(Boolean),
+);
+
+function isOwner(ctx: { from?: { username?: string; id?: number } }): boolean {
+  const u = ctx.from?.username?.toLowerCase();
+  return !!u && OWNER_USERNAMES.has(u);
+}
+
 bot.command("qr", async ctx => {
+  if (!isOwner(ctx)) {
+    return ctx.reply("⛔ هذا الأمر مخصص لمالك البوت فقط.");
+  }
   if (!voiceManager.isReady()) return ctx.reply("⏳ خدمة المكالمات لم تبدأ.");
   const msg = await ctx.reply("🔄 جارٍ إنشاء رمز QR…");
   const r = await voiceManager.qrLogin();
