@@ -362,6 +362,22 @@ const voiceQueue = new Map<number, QueueItem[]>();
 const nowPlaying = new Map<number, QueueItem>();
 const pendingQR = new Map<number, number>();
 const playbackMsg = new Map<number, { messageId: number; paused: boolean }>(); // chatId → control msg
+const playbackGen = new Map<number, number>(); // chatId → generation (incremented on manual skip/stop)
+const currentTrackTmp = new Map<number, string>(); // chatId → tmp file path of current track (for cleanup)
+
+function bumpGen(chatId: number): number {
+  const n = (playbackGen.get(chatId) ?? 0) + 1;
+  playbackGen.set(chatId, n);
+  return n;
+}
+
+async function cleanupCurrentTrackTmp(chatId: number) {
+  const fp = currentTrackTmp.get(chatId);
+  currentTrackTmp.delete(chatId);
+  if (fp && fp.includes("/tgreply_") && existsSync(fp)) {
+    await unlink(fp).catch(() => {});
+  }
+}
 
 function playbackKeyboard(chatId: number, paused: boolean): InlineKeyboard {
   return new InlineKeyboard()
@@ -392,6 +408,7 @@ async function processVoiceQueue(chatId: number, api: Bot["api"]) {
   if (!queue?.length) {
     voiceQueue.delete(chatId);
     nowPlaying.delete(chatId);
+    await cleanupCurrentTrackTmp(chatId);
     const old = playbackMsg.get(chatId);
     if (old) { api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
     return;
@@ -401,6 +418,10 @@ async function processVoiceQueue(chatId: number, api: Bot["api"]) {
     const fp = item.localFile ?? await downloadAudio(item.videoId);
     const r = await voiceManager.joinAndPlay(chatId, fp);
     if (!r.ok) throw new Error(String(r.error ?? "فشل"));
+    // New track started — bump generation so old stream_end events are ignored
+    bumpGen(chatId);
+    await cleanupCurrentTrackTmp(chatId);
+    currentTrackTmp.set(chatId, fp);
     nowPlaying.set(chatId, item);
     await sendPlaybackControls(chatId, api, item);
     if (queue[1] && !queue[1].localFile) downloadAudio(queue[1].videoId).catch(() => {});
@@ -644,7 +665,11 @@ bot.on("message:text", async ctx => {
     if (!await canControlPlayback(ctx.api, chatId, userId)) {
       return ctx.reply("⛔ فقط من طلب الأغنية أو المشرفون يقدرون يوقفون.");
     }
+    bumpGen(chatId);
     voiceQueue.delete(chatId); nowPlaying.delete(chatId);
+    await cleanupCurrentTrackTmp(chatId);
+    const oldMsg = playbackMsg.get(chatId);
+    if (oldMsg) { ctx.api.deleteMessage(chatId, oldMsg.messageId).catch(() => {}); playbackMsg.delete(chatId); }
     if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
     await ctx.reply("⏹ تم الإيقاف.");
     return;
@@ -659,11 +684,18 @@ bot.on("message:text", async ctx => {
     }
     const queue = voiceQueue.get(chatId) ?? [];
     queue.shift();
+    bumpGen(chatId);
+    nowPlaying.delete(chatId);
+    await cleanupCurrentTrackTmp(chatId);
     if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
     if (queue.length) {
       await ctx.reply(`⏭ التالي: *${queue[0]!.title}*`, { parse_mode: "Markdown" });
       processVoiceQueue(chatId, ctx.api);
-    } else { nowPlaying.delete(chatId); await ctx.reply("✅ انتهى الطابور."); }
+    } else {
+      const oldMsg2 = playbackMsg.get(chatId);
+      if (oldMsg2) { ctx.api.deleteMessage(chatId, oldMsg2.messageId).catch(() => {}); playbackMsg.delete(chatId); }
+      await ctx.reply("✅ انتهى الطابور.");
+    }
     return;
   }
 
@@ -757,17 +789,21 @@ bot.callbackQuery(/^vc:(pause|resume|next|stop):(-?\d+)$/, async ctx => {
     } else if (action === "next") {
       const queue = voiceQueue.get(chatId) ?? [];
       queue.shift();
+      bumpGen(chatId);
+      nowPlaying.delete(chatId); // marks track as "not playing" so stale stream_end is ignored
+      await cleanupCurrentTrackTmp(chatId);
       if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
       await ctx.answerCallbackQuery({ text: "⏭ التالي" });
       if (queue.length) processVoiceQueue(chatId, ctx.api);
       else {
-        nowPlaying.delete(chatId);
         const old = playbackMsg.get(chatId);
         if (old) { ctx.api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
         await ctx.api.sendMessage(chatId, "✅ انتهى الطابور.").catch(() => {});
       }
     } else if (action === "stop") {
+      bumpGen(chatId);
       voiceQueue.delete(chatId); nowPlaying.delete(chatId);
+      await cleanupCurrentTrackTmp(chatId);
       if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
       const old = playbackMsg.get(chatId);
       if (old) { ctx.api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
@@ -830,13 +866,15 @@ export async function startBot() {
     } else if (msg["event"] === "stream_end") {
       const chatId = Number(msg["chat_id"]);
       if (!chatId) return;
+      // Ignore stream_end if nothing is currently playing — it's likely
+      // a stale event from a track that was just manually skipped/stopped.
+      if (!nowPlaying.has(chatId)) return;
       const queue = voiceQueue.get(chatId) ?? [];
-      queue.shift(); // أزل الأغنية المنتهية
+      queue.shift();
+      await cleanupCurrentTrackTmp(chatId);
       if (queue.length) {
-        // شغّل الأغنية التالية
         processVoiceQueue(chatId, bot.api);
       } else {
-        // الطابور فرغ — اطلع من المكالمة
         voiceQueue.delete(chatId);
         nowPlaying.delete(chatId);
         const old = playbackMsg.get(chatId);
