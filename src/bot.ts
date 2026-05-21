@@ -806,7 +806,11 @@ export async function startBot() {
   voiceManager.on("message", async (msg: Record<string, unknown>) => {
     if (msg["event"] === "qr_logged_in") {
       let txt = `✅ تم تسجيل الدخول!\n👤 ${String(msg["name"])} (${String(msg["phone"])})`;
-      if (msg["session_string"]) txt += `\n\n💾 *Session String:*\n\`${String(msg["session_string"])}\`\n\nضعه في \`TELEGRAM_SESSION_STRING\``;
+      if (msg["persisted"]) {
+        txt += `\n\n💾 تم حفظ الجلسة تلقائياً على القرص الدائم.\nلن تحتاج تسجيل دخول مرة ثانية حتى بعد إعادة النشر.`;
+      } else if (msg["session_string"]) {
+        txt += `\n\n⚠️ لم يُحفظ تلقائياً. ضع هذا في \`TELEGRAM_SESSION_STRING\`:\n\`${String(msg["session_string"])}\``;
+      }
       await notifyAll(txt);
     } else if (msg["event"] === "qr_timeout") {
       await notifyAll("⏰ انتهت صلاحية QR. استخدم /qr مجدداً.");
