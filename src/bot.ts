@@ -361,17 +361,48 @@ async function sendAudio(
 const voiceQueue = new Map<number, QueueItem[]>();
 const nowPlaying = new Map<number, QueueItem>();
 const pendingQR = new Map<number, number>();
+const playbackMsg = new Map<number, { messageId: number; paused: boolean }>(); // chatId → control msg
+
+function playbackKeyboard(chatId: number, paused: boolean): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(paused ? "▶️ استئناف" : "⏸ إيقاف مؤقت", `vc:${paused ? "resume" : "pause"}:${chatId}`)
+    .text("⏭ التالي", `vc:next:${chatId}`)
+    .text("⏹ ايقاف", `vc:stop:${chatId}`);
+}
+
+async function sendPlaybackControls(chatId: number, api: Bot["api"], item: QueueItem) {
+  // Delete old controls (if any)
+  const old = playbackMsg.get(chatId);
+  if (old) api.deleteMessage(chatId, old.messageId).catch(() => {});
+
+  try {
+    const sent = await api.sendMessage(
+      chatId,
+      `▶️ *${item.title}*\n👤 ${item.uploader}`,
+      { parse_mode: "Markdown", reply_markup: playbackKeyboard(chatId, false) },
+    );
+    playbackMsg.set(chatId, { messageId: sent.message_id, paused: false });
+  } catch (err) {
+    logger.warn({ err }, "sendPlaybackControls failed");
+  }
+}
 
 async function processVoiceQueue(chatId: number, api: Bot["api"]) {
   const queue = voiceQueue.get(chatId);
-  if (!queue?.length) { voiceQueue.delete(chatId); nowPlaying.delete(chatId); return; }
+  if (!queue?.length) {
+    voiceQueue.delete(chatId);
+    nowPlaying.delete(chatId);
+    const old = playbackMsg.get(chatId);
+    if (old) { api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
+    return;
+  }
   const item = queue[0]!;
   try {
-    // Use pre-downloaded file (from reply-to-audio) or download from YouTube.
     const fp = item.localFile ?? await downloadAudio(item.videoId);
     const r = await voiceManager.joinAndPlay(chatId, fp);
     if (!r.ok) throw new Error(String(r.error ?? "فشل"));
     nowPlaying.set(chatId, item);
+    await sendPlaybackControls(chatId, api, item);
     if (queue[1] && !queue[1].localFile) downloadAudio(queue[1].videoId).catch(() => {});
   } catch (err) {
     logger.error({ err }, "Voice failed");
@@ -671,6 +702,80 @@ bot.callbackQuery(/^dl:(.+)$/, async ctx => {
     .catch(err => logger.error({ err, videoId }, "sendAudio (callback) failed"));
 });
 
+// ── Voice control callbacks (pause/resume/next/stop) ─────────────────────
+bot.callbackQuery(/^vc:(pause|resume|next|stop):(-?\d+)$/, async ctx => {
+  const action = ctx.match[1] as "pause" | "resume" | "next" | "stop";
+  const chatId = Number(ctx.match[2]);
+  const userId = ctx.from?.id;
+  if (!userId || !chatId) return ctx.answerCallbackQuery();
+
+  if (!await canControlPlayback(ctx.api, chatId, userId)) {
+    return ctx.answerCallbackQuery({ text: "⛔ فقط من طلب الأغنية أو المشرفون", show_alert: true });
+  }
+
+  const cur = nowPlaying.get(chatId);
+  if (!cur && action !== "stop") return ctx.answerCallbackQuery({ text: "لا يوجد شيء قيد التشغيل" });
+
+  try {
+    if (action === "pause") {
+      const r = await voiceManager.pause(chatId);
+      if (!r.ok) throw new Error(String(r.error));
+      const st = playbackMsg.get(chatId);
+      if (st) {
+        st.paused = true;
+        await ctx.api.editMessageReplyMarkup(chatId, st.messageId, {
+          reply_markup: playbackKeyboard(chatId, true),
+        }).catch(() => {});
+      }
+      await ctx.answerCallbackQuery({ text: "⏸ تم الإيقاف المؤقت" });
+    } else if (action === "resume") {
+      const r = await voiceManager.resume(chatId);
+      if (!r.ok) throw new Error(String(r.error));
+      const st = playbackMsg.get(chatId);
+      if (st) {
+        st.paused = false;
+        await ctx.api.editMessageReplyMarkup(chatId, st.messageId, {
+          reply_markup: playbackKeyboard(chatId, false),
+        }).catch(() => {});
+      }
+      await ctx.answerCallbackQuery({ text: "▶️ استئناف" });
+    } else if (action === "next") {
+      const queue = voiceQueue.get(chatId) ?? [];
+      queue.shift();
+      if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
+      await ctx.answerCallbackQuery({ text: "⏭ التالي" });
+      if (queue.length) processVoiceQueue(chatId, ctx.api);
+      else {
+        nowPlaying.delete(chatId);
+        const old = playbackMsg.get(chatId);
+        if (old) { ctx.api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
+        await ctx.api.sendMessage(chatId, "✅ انتهى الطابور.").catch(() => {});
+      }
+    } else if (action === "stop") {
+      voiceQueue.delete(chatId); nowPlaying.delete(chatId);
+      if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
+      const old = playbackMsg.get(chatId);
+      if (old) { ctx.api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
+      await ctx.answerCallbackQuery({ text: "⏹ تم الإيقاف" });
+      await ctx.api.sendMessage(chatId, "⏹ تم الإيقاف.").catch(() => {});
+    }
+  } catch (err) {
+    logger.error({ err, action, chatId }, "vc callback failed");
+    await ctx.answerCallbackQuery({ text: `❌ ${(err as Error).message?.slice(0, 100) ?? "خطأ"}`, show_alert: true });
+  }
+});
+
+// ── yt-dlp auto-update ───────────────────────────────────────────────────
+async function autoUpdateYtDlp() {
+  try {
+    const { stdout, stderr } = await execFileAsync(YT_DLP_BIN, ["-U"], { timeout: 90_000, ...EXEC_OPTS });
+    const out = (stdout + stderr).trim().slice(0, 300);
+    logger.info({ out }, "yt-dlp self-update");
+  } catch (err) {
+    logger.warn({ err: String(err).slice(0, 200) }, "yt-dlp self-update failed (read-only install?)");
+  }
+}
+
 // ── Startup ───────────────────────────────────────────────────────────────
 async function notifyAll(text: string) {
   for (const [uid, cid] of pendingQR.entries()) {
@@ -686,6 +791,8 @@ export async function startBot() {
     logger.info({ username: BOT_USERNAME }, "Bot username");
   } catch { /* use default */ }
   await loadCache();
+  autoUpdateYtDlp().catch(() => {});
+  setInterval(() => autoUpdateYtDlp().catch(() => {}), 24 * 60 * 60 * 1000);
   voiceManager.start();
   voiceManager.once("ready", async () => {
     logger.info("VoiceService ready");
