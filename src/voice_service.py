@@ -76,29 +76,45 @@ async def get_calls():
         from pytgcalls import PyTgCalls
         calls = PyTgCalls(tl_client)
 
-        # Notify Node.js when a track finishes so it can advance the queue or leave
-        try:
-            from pytgcalls.types import StreamAudioEnded, StreamVideoEnded
-            @calls.on_stream_end()
-            async def _on_stream_end(_, update):
-                try:
-                    chat_id = getattr(update, "chat_id", None)
-                    if chat_id is not None and isinstance(update, (StreamAudioEnded, StreamVideoEnded)):
-                        send({"ok": True, "event": "stream_end", "chat_id": chat_id})
-                except Exception as ex:
-                    sys.stderr.write(f"[stream_end] handler error: {ex}\n")
-                    sys.stderr.flush()
-        except ImportError:
-            # Older pytgcalls — use generic update
-            @calls.on_stream_end()
-            async def _on_stream_end_fallback(_, update):
-                try:
+        # Notify Node.js when a track finishes (advance queue / leave call).
+        # py-tgcalls API differs across versions — try multiple registrations.
+        async def _emit_stream_end(update):
+            try:
+                cls_name = type(update).__name__
+                if "Ended" in cls_name or "End" in cls_name:
                     chat_id = getattr(update, "chat_id", None)
                     if chat_id is not None:
                         send({"ok": True, "event": "stream_end", "chat_id": chat_id})
-                except Exception as ex:
-                    sys.stderr.write(f"[stream_end] handler error: {ex}\n")
-                    sys.stderr.flush()
+            except Exception as ex:
+                sys.stderr.write(f"[stream_end] handler error: {ex}\n")
+                sys.stderr.flush()
+
+        registered = False
+        # Try modern: @calls.on_update()
+        if hasattr(calls, "on_update"):
+            try:
+                @calls.on_update()
+                async def _on_update_handler(_, update):
+                    await _emit_stream_end(update)
+                registered = True
+                sys.stderr.write("[stream_end] registered via on_update()\n")
+            except Exception as ex:
+                sys.stderr.write(f"[stream_end] on_update failed: {ex}\n")
+
+        # Fallback: older @calls.on_stream_end()
+        if not registered and hasattr(calls, "on_stream_end"):
+            try:
+                @calls.on_stream_end()
+                async def _on_stream_end_handler(_, update):
+                    await _emit_stream_end(update)
+                registered = True
+                sys.stderr.write("[stream_end] registered via on_stream_end()\n")
+            except Exception as ex:
+                sys.stderr.write(f"[stream_end] on_stream_end failed: {ex}\n")
+
+        if not registered:
+            sys.stderr.write("[stream_end] WARNING: no compatible event API found\n")
+        sys.stderr.flush()
 
         await calls.start()
     return calls
