@@ -61,7 +61,10 @@ class VoiceManager extends EventEmitter {
         if (!line.trim()) continue;
         try {
           const msg: VoiceMsg = JSON.parse(line);
-          logger.info({ msg }, "VoiceService msg");
+          // Redact sensitive fields before logging
+          const safe: Record<string, unknown> = { ...msg };
+          if (safe["session_string"]) safe["session_string"] = "[REDACTED]";
+          logger.info({ msg: safe }, "VoiceService msg");
           if (msg.event === "ready") {
             this.ready = true;
             this.emit("ready");
