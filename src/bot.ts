@@ -827,6 +827,23 @@ export async function startBot() {
         txt += `\n\n⚠️ لم يُحفظ تلقائياً. ضع هذا في \`TELEGRAM_SESSION_STRING\`:\n\`${String(msg["session_string"])}\``;
       }
       await notifyAll(txt);
+    } else if (msg["event"] === "stream_end") {
+      const chatId = Number(msg["chat_id"]);
+      if (!chatId) return;
+      const queue = voiceQueue.get(chatId) ?? [];
+      queue.shift(); // أزل الأغنية المنتهية
+      if (queue.length) {
+        // شغّل الأغنية التالية
+        processVoiceQueue(chatId, bot.api);
+      } else {
+        // الطابور فرغ — اطلع من المكالمة
+        voiceQueue.delete(chatId);
+        nowPlaying.delete(chatId);
+        const old = playbackMsg.get(chatId);
+        if (old) { bot.api.deleteMessage(chatId, old.messageId).catch(() => {}); playbackMsg.delete(chatId); }
+        if (voiceManager.isReady()) voiceManager.stop(chatId).catch(() => {});
+        bot.api.sendMessage(chatId, "✅ انتهى الطابور.").catch(() => {});
+      }
     } else if (msg["event"] === "qr_timeout") {
       await notifyAll("⏰ انتهت صلاحية QR. استخدم /qr مجدداً.");
     } else if (msg["event"] === "qr_error") {
