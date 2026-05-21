@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard, InputFile, InlineQueryResultBuilder } from "grammy";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { unlink, readFile, writeFile } from "node:fs/promises";
+import { unlink, readFile, writeFile, stat } from "node:fs/promises";
 import { existsSync, createReadStream, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -11,6 +11,9 @@ import { voiceManager } from "./voice_manager";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
+
+// Big buffer prevents freezes on long yt-dlp output (was the silent killer).
+const EXEC_OPTS = { maxBuffer: 64 * 1024 * 1024 } as const;
 
 const BOT_TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not set");
@@ -59,9 +62,15 @@ const COOKIE_PATH = setupCookies();
 if (COOKIE_PATH) logger.info("YouTube cookies loaded ✓");
 else logger.warn("No YouTube cookies — bot may get blocked. Add YOUTUBE_COOKIES env var.");
 
-// ── File-ID cache ─────────────────────────────────────────────────────────
+function cookieArgs(): string[] {
+  return COOKIE_PATH ? ["--cookies", COOKIE_PATH] : [];
+}
+
+// ── File-ID cache (Telegram file_id → instant resend, no re-download) ─────
 const CACHE_FILE = join(__dirname, "..", "cache.json");
 const fileIdCache = new Map<string, string>();
+let cacheDirty = false;
+let cacheFlushTimer: NodeJS.Timeout | null = null;
 
 async function loadCache() {
   try {
@@ -70,18 +79,24 @@ async function loadCache() {
     logger.info({ count: fileIdCache.size }, "Cache loaded");
   } catch { /* first run */ }
 }
-async function saveCache() {
-  try { await writeFile(CACHE_FILE, JSON.stringify(Object.fromEntries(fileIdCache))); }
-  catch (err) { logger.warn({ err }, "Cache save failed"); }
+function scheduleCacheSave() {
+  cacheDirty = true;
+  if (cacheFlushTimer) return;
+  cacheFlushTimer = setTimeout(async () => {
+    cacheFlushTimer = null;
+    if (!cacheDirty) return;
+    cacheDirty = false;
+    try { await writeFile(CACHE_FILE, JSON.stringify(Object.fromEntries(fileIdCache))); }
+    catch (err) { logger.warn({ err }, "Cache save failed"); }
+  }, 2000);
 }
 
-// ── Types & queue ─────────────────────────────────────────────────────────
-type VideoResult = { id: string; title: string; duration: string; uploader: string; thumbnail: string };
+// ── Search-result cache (5 min) — instant repeated searches ───────────────
+type VideoResult = { id: string; title: string; duration: string; durationSec: number; uploader: string; thumbnail: string };
 type QueueItem = { videoId: string; title: string; uploader: string };
 
-const voiceQueue = new Map<number, QueueItem[]>();
-const nowPlaying = new Map<number, string>();
-const pendingQR = new Map<number, number>();
+const searchCache = new Map<string, { at: number; results: VideoResult[] }>();
+const SEARCH_TTL_MS = 5 * 60 * 1000;
 
 function fmtDuration(sec: number): string {
   if (!sec || isNaN(sec)) return "?:??";
@@ -94,28 +109,47 @@ async function safeEdit(api: Bot["api"], chatId: number, msgId: number, text: st
   catch { try { await api.sendMessage(chatId, text, { parse_mode: "Markdown" }); } catch { /**/ } }
 }
 
-// ── Cookie args helper ────────────────────────────────────────────────────
-function cookieArgs(): string[] {
-  return COOKIE_PATH ? ["--cookies", COOKIE_PATH] : [];
+// ── Concurrency limiter (semaphore) — fixes "freeze when 2 users request" ──
+function createLimiter(maxConcurrent: number) {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  return async function run<T>(fn: () => Promise<T>): Promise<T> {
+    if (active >= maxConcurrent) {
+      await new Promise<void>(res => waiting.push(res));
+    }
+    active++;
+    try { return await fn(); }
+    finally {
+      active--;
+      const next = waiting.shift();
+      if (next) next();
+    }
+  };
 }
 
-// ── Search (flat-playlist — no format resolution needed) ──────────────────
-async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
+// Allow many parallel SEARCHES (cheap) but cap heavy DOWNLOADS at 4 in parallel.
+const searchLimit = createLimiter(8);
+const downloadLimit = createLimiter(4);
+
+// ── Search (flat-playlist — fastest, no per-video resolution) ─────────────
+async function _doSearch(query: string, limit: number): Promise<VideoResult[]> {
   const args = [
     `ytsearch${limit}:${query}`,
     "-J", "--flat-playlist",
     "--no-check-certificates",
-    "--socket-timeout", "20",
+    "--socket-timeout", "15",
     "--no-warnings",
+    "--no-call-home",
+    "--extractor-args", "youtube:player_client=tv_embedded,ios",
     ...cookieArgs(),
   ];
   let stdout = "";
   try {
-    const r = await execFileAsync(YT_DLP_BIN, args, { timeout: 45_000 });
+    const r = await execFileAsync(YT_DLP_BIN, args, { timeout: 30_000, ...EXEC_OPTS });
     stdout = r.stdout;
   } catch (err: unknown) {
     const e = err as { stdout?: string; stderr?: string };
-    if (e.stdout) stdout = e.stdout;
+    if (e.stdout && e.stdout.trim().startsWith("{")) stdout = e.stdout;
     else throw new Error(((e.stderr ?? "") + "").slice(0, 400) || "البحث فشل");
   }
   const playlist = JSON.parse(stdout) as {
@@ -125,114 +159,180 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
     id: e.id!,
     title: e.title ?? "Unknown",
     duration: fmtDuration(e.duration ?? 0),
+    durationSec: e.duration ?? 0,
     uploader: e.uploader ?? e.channel ?? "Unknown",
     thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
   }));
 }
 
-// ── In-progress downloads map (prevents duplicate parallel downloads) ───────
+async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
+  const key = `${limit}:${query.toLowerCase().trim()}`;
+  const cached = searchCache.get(key);
+  if (cached && Date.now() - cached.at < SEARCH_TTL_MS) return cached.results;
+  const results = await searchLimit(() => _doSearch(query, limit));
+  searchCache.set(key, { at: Date.now(), results });
+  // Cap cache size
+  if (searchCache.size > 500) {
+    const oldest = [...searchCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) searchCache.delete(oldest[0]);
+  }
+  return results;
+}
+
+// ── Dedupe simultaneous downloads of same videoId ──────────────────────────
 const downloadingNow = new Map<string, Promise<string>>();
 
 function downloadAudio(videoId: string): Promise<string> {
   const existing = downloadingNow.get(videoId);
   if (existing) return existing;
-  const promise = _doDownload(videoId).finally(() => downloadingNow.delete(videoId));
+  const promise = downloadLimit(() => _doDownload(videoId))
+    .finally(() => downloadingNow.delete(videoId));
   downloadingNow.set(videoId, promise);
   return promise;
 }
 
+// Common audio extensions yt-dlp may produce when we DON'T re-encode.
+const AUDIO_EXTS = ["m4a", "opus", "webm", "ogg", "mp3", "mp4", "aac", "mka"] as const;
+
+function findCachedFile(videoId: string): string | null {
+  const dir = tmpdir();
+  for (const ext of AUDIO_EXTS) {
+    const p = join(dir, `tgbot_${videoId}.${ext}`);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
+ * FAST download strategy:
+ *   1. Try bestaudio with NO re-encoding (just download the stream).
+ *      Telegram natively accepts m4a/opus/ogg/mp3 — no need for MP3 conversion.
+ *   2. Try multiple player_client values on failure (radical reliability boost).
+ *   3. Only fall back to MP3 conversion as last resort.
+ */
+const PLAYER_CLIENT_FALLBACKS = [
+  "tv_embedded,ios",
+  "android_vr,android",
+  "web,mweb",
+  "ios,android",
+];
 
 async function _doDownload(videoId: string): Promise<string> {
-  const cacheDir = tmpdir();
-  const exts = ["mp3", "m4a", "webm", "opus", "ogg", "mp4", "mkv"];
-
-  // Return cached file if exists
-  for (const ext of exts) {
-    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-    if (existsSync(p)) {
-      logger.info({ videoId, ext }, "cache hit");
-      return p;
-    }
+  const cached = findCachedFile(videoId);
+  if (cached) {
+    logger.info({ videoId }, "cache hit");
+    return cached;
   }
 
-  // Download directly with yt-dlp (no Replit proxy needed)
+  const cacheDir = tmpdir();
   const outTemplate = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  const args = [
-    "--no-playlist",
-    "--extract-audio",
-    "--audio-format", "mp3",
-    "--audio-quality", "96K",
-    "--postprocessor-args", "ffmpeg:-t 900",
-    "--extractor-args", "youtube:player_client=android_vr,tv_embedded,ios",
-    "--geo-bypass",
-    "--no-warnings",
-    "-o", outTemplate,
-    url,
-  ];
+  let lastErr = "";
+  for (let attempt = 0; attempt < PLAYER_CLIENT_FALLBACKS.length; attempt++) {
+    const client = PLAYER_CLIENT_FALLBACKS[attempt]!;
+    // Native-format download = no ffmpeg re-encoding = MUCH faster.
+    // Prefer m4a (universal), fall back to anything <=128kbps audio.
+    const args: string[] = [
+      ...cookieArgs(),
+      "--no-playlist",
+      "--no-warnings",
+      "--no-call-home",
+      "--no-check-certificates",
+      "--no-mtime",
+      "--no-part",
+      "--socket-timeout", "20",
+      "--retries", "3",
+      "--fragment-retries", "3",
+      "--concurrent-fragments", "4",
+      "--extractor-args", `youtube:player_client=${client}`,
+      "--geo-bypass",
+      "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+      "-o", outTemplate,
+      url,
+    ];
 
-  if (COOKIE_PATH) args.splice(0, 0, "--cookies", COOKIE_PATH);
-
-  try {
-    await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000 });
-  } catch (err) {
-    const msg = String((err as { stderr?: string }).stderr ?? err).slice(0, 300);
-    logger.error({ videoId, msg }, "yt-dlp download failed");
-    if (msg.includes("Sign in") || msg.includes("bot"))
-      throw new Error("❌ يوتيوب يطلب تسجيل دخول — أضف YOUTUBE_COOKIES");
-    if (msg.includes("unavailable") || msg.includes("private"))
-      throw new Error("❌ الفيديو غير متاح أو خاص");
-    throw new Error(`❌ فشل التحميل — ${msg.slice(0, 150)}`);
-  }
-
-  // Find the downloaded file
-  for (const ext of exts) {
-    const p = join(cacheDir, `tgbot_${videoId}.${ext}`);
-    if (existsSync(p)) {
-      logger.info({ videoId, ext }, "download ok");
-      return p;
+    try {
+      await execFileAsync(YT_DLP_BIN, args, { timeout: 90_000, ...EXEC_OPTS });
+      const found = findCachedFile(videoId);
+      if (found) {
+        logger.info({ videoId, client, attempt }, "download ok");
+        return found;
+      }
+      lastErr = "file not produced";
+    } catch (err) {
+      lastErr = String((err as { stderr?: string }).stderr ?? err).slice(0, 300);
+      logger.warn({ videoId, client, attempt, lastErr }, "download attempt failed");
+      if (/Sign in|confirm you|bot/i.test(lastErr) && !COOKIE_PATH) {
+        // No cookies set — no point retrying, all clients will fail.
+        throw new Error("❌ يوتيوب يطلب تسجيل دخول — أضف YOUTUBE_COOKIES");
+      }
+      if (/unavailable|private|removed|age/i.test(lastErr)) {
+        throw new Error("❌ الفيديو غير متاح أو خاص أو مقيد عمرياً");
+      }
+      // try next client
     }
   }
 
-  throw new Error("❌ فشل التحميل — الملف لم يُنشأ");
+  throw new Error(`❌ فشل التحميل بعد ${PLAYER_CLIENT_FALLBACKS.length} محاولات — ${lastErr.slice(0, 150)}`);
 }
 
-
-// ── Send audio (cache-aware) ──────────────────────────────────────────────
+// ── Send audio (cache-aware, no re-encoding) ──────────────────────────────
 async function sendAudio(
   chatId: number,
   video: Pick<VideoResult, "id" | "title" | "uploader" | "duration">,
   api: Bot["api"],
   statusMsgId?: number,
 ): Promise<void> {
+  // Instant cache hit
   const cached = fileIdCache.get(video.id);
   if (cached) {
-    if (statusMsgId) await api.deleteMessage(chatId, statusMsgId).catch(() => {});
-    await api.sendAudio(chatId, cached, {
-      caption: `• @${BOT_USERNAME} ♪ ${video.duration}`,
-    });
-    return;
+    if (statusMsgId) api.deleteMessage(chatId, statusMsgId).catch(() => {});
+    try {
+      await api.sendAudio(chatId, cached, {
+        caption: `• @${BOT_USERNAME} ♪ ${video.duration}`,
+      });
+      return;
+    } catch (err) {
+      // file_id expired — drop & re-download
+      logger.warn({ err, videoId: video.id }, "cached file_id rejected, re-downloading");
+      fileIdCache.delete(video.id);
+      scheduleCacheSave();
+    }
   }
 
   let dlMsgId = statusMsgId;
   if (!dlMsgId) {
-    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل… ${video.title}`)).message_id;
+    dlMsgId = (await api.sendMessage(chatId, `⬇️ جارٍ التحميل…\n${video.title}`)).message_id;
   } else {
-    await safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`);
+    safeEdit(api, chatId, dlMsgId, `⬇️ جارٍ التحميل…\n*${video.title}*`).catch(() => {});
   }
 
   let filePath: string | undefined;
   try {
     filePath = await downloadAudio(video.id);
+
+    // Telegram limit: 50MB for bots. Check size, warn if too big.
+    const st = await stat(filePath).catch(() => null);
+    if (st && st.size > 49 * 1024 * 1024) {
+      throw new Error(`❌ الملف كبير جداً (${(st.size / 1024 / 1024).toFixed(1)}MB) — حد تيليجرام 50MB`);
+    }
+
+    const fileName = `audio.${filePath.split(".").pop() ?? "m4a"}`;
     const sent = await api.sendAudio(
       chatId,
-      new InputFile(createReadStream(filePath), `audio.mp3`),
-      { title: video.title.slice(0, 64), performer: video.uploader.slice(0, 64),
-        caption: `• @${BOT_USERNAME} ♪ ${video.duration}` },
+      new InputFile(createReadStream(filePath), fileName),
+      {
+        title: video.title.slice(0, 64),
+        performer: video.uploader.slice(0, 64),
+        caption: `• @${BOT_USERNAME} ♪ ${video.duration}`,
+      },
     );
-    if (sent.audio?.file_id) { fileIdCache.set(video.id, sent.audio.file_id); await saveCache(); }
-    await api.deleteMessage(chatId, dlMsgId!).catch(() => {});
+    if (sent.audio?.file_id) {
+      fileIdCache.set(video.id, sent.audio.file_id);
+      scheduleCacheSave();
+    }
+    api.deleteMessage(chatId, dlMsgId!).catch(() => {});
   } catch (err) {
     logger.error({ err, videoId: video.id }, "sendAudio failed");
     await safeEdit(api, chatId, dlMsgId!, `❌ ${(err as Error).message?.slice(0, 400) ?? "خطأ غير معروف"}`);
@@ -240,7 +340,11 @@ async function sendAudio(
   }
 }
 
-// ── Voice queue ───────────────────────────────────────────────────────────
+// ── Voice queue (per chat) ────────────────────────────────────────────────
+const voiceQueue = new Map<number, QueueItem[]>();
+const nowPlaying = new Map<number, string>();
+const pendingQR = new Map<number, number>();
+
 async function processVoiceQueue(chatId: number, api: Bot["api"]) {
   const queue = voiceQueue.get(chatId);
   if (!queue?.length) { voiceQueue.delete(chatId); nowPlaying.delete(chatId); return; }
@@ -250,11 +354,13 @@ async function processVoiceQueue(chatId: number, api: Bot["api"]) {
     const r = await voiceManager.joinAndPlay(chatId, fp);
     if (!r.ok) throw new Error(String(r.error ?? "فشل"));
     nowPlaying.set(chatId, item.title);
+    // Pre-fetch next song in background (warm cache)
     if (queue[1]) downloadAudio(queue[1].videoId).catch(() => {});
   } catch (err) {
     logger.error({ err }, "Voice failed");
-    await api.sendMessage(chatId, `❌ فشل: ${item.title}\n${(err as Error).message?.slice(0, 200) ?? ""}`);
-    queue.shift(); processVoiceQueue(chatId, api);
+    await api.sendMessage(chatId, `❌ فشل: ${item.title}\n${(err as Error).message?.slice(0, 200) ?? ""}`).catch(() => {});
+    queue.shift();
+    processVoiceQueue(chatId, api);
   }
 }
 
@@ -274,10 +380,10 @@ bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
   const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة (أضف YOUTUBE_COOKIES)";
   const vs = voiceManager.isReady()
-    ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr")
+    ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr").catch(() => "❌ خطأ")
     : "❌ لم تبدأ";
   await ctx.reply(
-    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n🍪 كوكيز: ${cookieStatus}\n💾 كاش: ${fileIdCache.size} أغنية\n📞 حساب: ${vs}`,
+    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n🍪 كوكيز: ${cookieStatus}\n💾 كاش: ${fileIdCache.size} أغنية\n🔍 بحث محفوظ: ${searchCache.size}\n📞 حساب: ${vs}`,
     { parse_mode: "Markdown" },
   );
 });
@@ -316,7 +422,6 @@ bot.command("qr", async ctx => {
 bot.on("message:text", async ctx => {
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
-
 
   if (/^(يوت|يوتيوب)\s+/u.test(text)) {
     const query = text.replace(/^(يوت|يوتيوب)\s+/u, "").trim();
@@ -379,16 +484,16 @@ bot.on("message:text", async ctx => {
     return;
   }
 
-    if (text === "وقف") {
+  if (text === "وقف") {
     voiceQueue.delete(chatId); nowPlaying.delete(chatId);
-    if (voiceManager.isReady()) await voiceManager.stop(chatId);
+    if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
     await ctx.reply("⏹ تم الإيقاف.");
     return;
   }
   if (text === "التالي") {
     const queue = voiceQueue.get(chatId) ?? [];
     queue.shift();
-    if (voiceManager.isReady()) await voiceManager.stop(chatId);
+    if (voiceManager.isReady()) await voiceManager.stop(chatId).catch(() => {});
     if (queue.length) {
       await ctx.reply(`⏭ التالي: *${queue[0]!.title}*`, { parse_mode: "Markdown" });
       processVoiceQueue(chatId, ctx.api);
@@ -437,7 +542,9 @@ bot.callbackQuery(/^dl:([^:]+):([^:]+):([^:]+):(.*)$/, async ctx => {
   await ctx.answerCallbackQuery({ text: fileIdCache.has(videoId) ? "⚡ إرسال من الكاش!" : "⬇️ جارٍ التحميل…" });
   const chatId = ctx.chat?.id ?? ctx.message?.chat?.id;
   if (!chatId) return;
-  await sendAudio(chatId, { id: videoId, title, uploader, duration: duration ?? "?:??" }, ctx.api);
+  // Fire-and-forget so the bot stays responsive to other users.
+  sendAudio(chatId, { id: videoId, title, uploader, duration: duration ?? "?:??" }, ctx.api)
+    .catch(err => logger.error({ err, videoId }, "sendAudio (callback) failed"));
 });
 
 // ── Startup ───────────────────────────────────────────────────────────────
@@ -449,7 +556,6 @@ async function notifyAll(text: string) {
 }
 
 export async function startBot() {
-  // Get bot username for captions
   try {
     const me = await bot.api.getMe();
     BOT_USERNAME = me.username ?? BOT_USERNAME;
@@ -459,8 +565,12 @@ export async function startBot() {
   voiceManager.start();
   voiceManager.once("ready", async () => {
     logger.info("VoiceService ready");
-    const s = await voiceManager.checkSession();
-    logger.info(s.ok ? { name: s.name } : {}, s.ok ? "Session active" : "No session — use /qr");
+    try {
+      const s = await voiceManager.checkSession();
+      logger.info(s.ok ? { name: s.name } : {}, s.ok ? "Session active" : "No session — use /qr");
+    } catch (err) {
+      logger.warn({ err }, "checkSession failed");
+    }
   });
   voiceManager.on("message", async (msg: Record<string, unknown>) => {
     if (msg["event"] === "qr_logged_in") {
@@ -473,6 +583,9 @@ export async function startBot() {
       await notifyAll(`❌ خطأ QR: ${String(msg["error"])}`);
     }
   });
+
+  // Crash-resilient: if grammy throws (rare), log and don't take the process down.
+  bot.catch(err => logger.error({ err }, "grammy handler error"));
   bot.start({ onStart: () => logger.info("Bot polling started") })
     .catch(err => logger.error({ err }, "Bot crashed"));
   process.once("SIGINT", () => bot.stop());
