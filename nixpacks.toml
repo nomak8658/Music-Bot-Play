@@ -6,11 +6,10 @@ cmds = ["npm install"]
 
 [phases.build]
 cmds = [
-  "python3 -m pip install -q --upgrade yt-dlp",
   "node build.mjs",
   "python3 -m venv .venv",
-  ".venv/bin/pip install -q --upgrade pip",
-  ".venv/bin/pip install -q pyrogram tgcrypto py-tgcalls"
+  ".venv/bin/pip install -q --upgrade pip yt-dlp",
+  ".venv/bin/pip install -q telethon cryptg py-tgcalls"
 ]
 
 [start]
