@@ -7,5 +7,5 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
 fi
 echo "[setup_venv] Installing packages..."
 "$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install pyrogram tgcrypto py-tgcalls
+"$VENV_DIR/bin/pip" install --upgrade yt-dlp telethon cryptg py-tgcalls
 echo "[setup_venv] Done."
