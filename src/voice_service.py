@@ -75,6 +75,31 @@ async def get_calls():
             raise RuntimeError("No active user session — use /qr to log in")
         from pytgcalls import PyTgCalls
         calls = PyTgCalls(tl_client)
+
+        # Notify Node.js when a track finishes so it can advance the queue or leave
+        try:
+            from pytgcalls.types import StreamAudioEnded, StreamVideoEnded
+            @calls.on_stream_end()
+            async def _on_stream_end(_, update):
+                try:
+                    chat_id = getattr(update, "chat_id", None)
+                    if chat_id is not None and isinstance(update, (StreamAudioEnded, StreamVideoEnded)):
+                        send({"ok": True, "event": "stream_end", "chat_id": chat_id})
+                except Exception as ex:
+                    sys.stderr.write(f"[stream_end] handler error: {ex}\n")
+                    sys.stderr.flush()
+        except ImportError:
+            # Older pytgcalls — use generic update
+            @calls.on_stream_end()
+            async def _on_stream_end_fallback(_, update):
+                try:
+                    chat_id = getattr(update, "chat_id", None)
+                    if chat_id is not None:
+                        send({"ok": True, "event": "stream_end", "chat_id": chat_id})
+                except Exception as ex:
+                    sys.stderr.write(f"[stream_end] handler error: {ex}\n")
+                    sys.stderr.flush()
+
         await calls.start()
     return calls
 
