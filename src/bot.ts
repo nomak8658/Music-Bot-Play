@@ -155,7 +155,7 @@ async function _doSearch(query: string, limit: number): Promise<VideoResult[]> {
     "--no-check-certificates",
     "--socket-timeout", "15",
     "--no-warnings",
-    "--no-call-home",
+
     "--extractor-args", "youtube:player_client=tv_embedded,ios",
     ...cookieArgs(),
   ];
@@ -242,7 +242,7 @@ async function _doDownload(videoId: string): Promise<string> {
       ...cookieArgs(),
       "--no-playlist",
       "--no-warnings",
-      "--no-call-home",
+  
       "--no-check-certificates",
       "--no-mtime",
       "--no-part",
