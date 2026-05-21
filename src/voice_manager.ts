@@ -141,6 +141,8 @@ class VoiceManager extends EventEmitter {
     return this.request({ cmd: "join_and_play", chat_id: chatId, audio_file: audioFile });
   }
   stop(chatId: number) { return this.request({ cmd: "stop", chat_id: chatId }); }
+  pause(chatId: number) { return this.request({ cmd: "pause", chat_id: chatId }); }
+  resume(chatId: number) { return this.request({ cmd: "resume", chat_id: chatId }); }
   skip(chatId: number, audioFile: string) {
     return this.request({ cmd: "skip", chat_id: chatId, audio_file: audioFile });
   }
