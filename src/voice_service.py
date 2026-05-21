@@ -20,6 +20,37 @@ API_ID   = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING", "")
 
+# Persistent session file on volume — survives redeploys
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+SESSION_FILE = DATA_DIR / "telethon_session.txt"
+
+def _load_session_from_file() -> str:
+    try:
+        if SESSION_FILE.exists():
+            s = SESSION_FILE.read_text().strip()
+            if s:
+                return s
+    except Exception as e:
+        sys.stderr.write(f"[session] read failed: {e}\n")
+        sys.stderr.flush()
+    return ""
+
+def _save_session_to_file(session_str: str):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(session_str)
+        try:
+            os.chmod(SESSION_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        sys.stderr.write(f"[session] write failed: {e}\n")
+        sys.stderr.flush()
+
+# Env var takes priority; else load from persistent file
+if not SESSION_STRING:
+    SESSION_STRING = _load_session_from_file()
+
 # Global Telethon client and pytgcalls instance
 tl_client = None   # TelegramClient (Telethon)
 calls     = None   # PyTgCalls
@@ -96,12 +127,16 @@ async def _wait_telethon_qr(tl, qr):
         tl_client = tl            # keep alive — pytgcalls will use it
         calls = None              # reset so get_calls() re-creates with new client
 
+        # Persist to volume so we don't need to /qr again after redeploys
+        _save_session_to_file(session_str)
+
         send({
             "ok": True,
             "event": "qr_logged_in",
             "name": me.first_name or "",
             "phone": getattr(me, "phone", "") or "",
             "session_string": session_str,
+            "persisted": True,
         })
 
     except asyncio.TimeoutError:
