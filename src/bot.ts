@@ -118,8 +118,17 @@ const SEARCH_TTL_MS = 5 * 60 * 1000;
 
 function fmtDuration(sec: number): string {
   if (!sec || isNaN(sec)) return "?:??";
-  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function parseDuration(iso: string): number {
+  const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  return (parseInt(match[1] ?? "0") * 3600) + (parseInt(match[2] ?? "0") * 60) + parseInt(match[3] ?? "0");
 }
 
 async function safeEdit(api: Bot["api"], chatId: number, msgId: number, text: string) {
@@ -147,16 +156,75 @@ function createLimiter(maxConcurrent: number) {
 const searchLimit = createLimiter(8);
 const downloadLimit = createLimiter(4);
 
-// ── Search ─────────────────────────────────────────────────────────────────
-async function _doSearch(query: string, limit: number): Promise<VideoResult[]> {
+// ── Search via YouTube Data API v3 ─────────────────────────────────────────
+const YOUTUBE_API_KEY = process.env["GOOGLE_API_KEY"] ?? process.env["YOUTUBE_API_KEY"] ?? "";
+if (YOUTUBE_API_KEY) logger.info("YouTube Data API v3 key loaded ✓");
+else logger.warn("GOOGLE_API_KEY not set — falling back to yt-dlp search");
+
+async function _searchViaYouTubeAPI(query: string, limit: number): Promise<VideoResult[]> {
+  // Step 1: search
+  const searchUrl =
+    `https://www.googleapis.com/youtube/v3/search?part=snippet` +
+    `&q=${encodeURIComponent(query)}&type=video&maxResults=${limit}` +
+    `&key=${YOUTUBE_API_KEY}`;
+  const searchRes = await fetch(searchUrl, { signal: AbortSignal.timeout(15_000) });
+  if (!searchRes.ok) {
+    const body = await searchRes.text().catch(() => "");
+    throw new Error(`YouTube API ${searchRes.status}: ${body.slice(0, 200)}`);
+  }
+  const searchData = await searchRes.json() as {
+    items?: Array<{
+      id: { videoId: string };
+      snippet: {
+        title: string;
+        channelTitle: string;
+        thumbnails: { default?: { url: string }; medium?: { url: string } };
+      };
+    }>;
+    error?: { message: string };
+  };
+  if (searchData.error) throw new Error(`YouTube API: ${searchData.error.message}`);
+  const items = searchData.items ?? [];
+  if (!items.length) return [];
+
+  // Step 2: fetch durations in one batch
+  const ids = items.map(i => i.id.videoId).join(",");
+  const detailsUrl =
+    `https://www.googleapis.com/youtube/v3/videos?part=contentDetails` +
+    `&id=${ids}&key=${YOUTUBE_API_KEY}`;
+  const detailsRes = await fetch(detailsUrl, { signal: AbortSignal.timeout(10_000) });
+  const durationMap = new Map<string, number>();
+  if (detailsRes.ok) {
+    const dd = await detailsRes.json() as {
+      items?: Array<{ id: string; contentDetails: { duration: string } }>;
+    };
+    for (const v of dd.items ?? []) durationMap.set(v.id, parseDuration(v.contentDetails.duration));
+  }
+
+  return items.map(item => {
+    const videoId = item.id.videoId;
+    const durSec = durationMap.get(videoId) ?? 0;
+    const thumb = item.snippet.thumbnails.medium?.url ?? item.snippet.thumbnails.default?.url ?? "";
+    return {
+      id: videoId,
+      title: item.snippet.title,
+      duration: fmtDuration(durSec),
+      durationSec: durSec,
+      uploader: item.snippet.channelTitle,
+      thumbnail: thumb,
+    };
+  });
+}
+
+// ── Search via yt-dlp (fallback) ───────────────────────────────────────────
+async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResult[]> {
   const args = [
     `ytsearch${limit}:${query}`,
     "-J", "--flat-playlist",
     "--no-check-certificates",
     "--socket-timeout", "15",
     "--no-warnings",
-
-    "--extractor-args", "youtube:player_client=tv_embedded,ios",
+    "--extractor-args", "youtube:player_client=mweb,tv_embedded",
     ...cookieArgs(),
   ];
   let stdout = "";
@@ -185,7 +253,14 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   const key = `${limit}:${query.toLowerCase().trim()}`;
   const cached = searchCache.get(key);
   if (cached && Date.now() - cached.at < SEARCH_TTL_MS) return cached.results;
-  const results = await searchLimit(() => _doSearch(query, limit));
+
+  let results: VideoResult[];
+  if (YOUTUBE_API_KEY) {
+    results = await searchLimit(() => _searchViaYouTubeAPI(query, limit));
+  } else {
+    results = await searchLimit(() => _searchViaYtDlp(query, limit));
+  }
+
   searchCache.set(key, { at: Date.now(), results });
   if (searchCache.size > 500) {
     const oldest = [...searchCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
@@ -217,11 +292,13 @@ function findCachedFile(videoId: string): string | null {
   return null;
 }
 
+// Player clients tried in order — mweb & tv_embedded bypass most 403s without cookies.
 const PLAYER_CLIENT_FALLBACKS = [
-  "tv_embedded,ios",
-  "android_vr,android",
-  "web,mweb",
-  "ios,android",
+  "mweb",
+  "tv_embedded",
+  "ios",
+  "android",
+  "web",
 ];
 
 async function _doDownload(videoId: string): Promise<string> {
@@ -242,23 +319,23 @@ async function _doDownload(videoId: string): Promise<string> {
       ...cookieArgs(),
       "--no-playlist",
       "--no-warnings",
-  
       "--no-check-certificates",
       "--no-mtime",
       "--no-part",
-      "--socket-timeout", "20",
+      "--socket-timeout", "30",
       "--retries", "3",
-      "--fragment-retries", "3",
+      "--fragment-retries", "5",
       "--concurrent-fragments", "4",
       "--extractor-args", `youtube:player_client=${client}`,
+      "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+      "-f", "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=webm]/bestaudio/best",
       "-o", outTemplate,
       url,
     ];
 
     try {
-      await execFileAsync(YT_DLP_BIN, args, { timeout: 90_000, ...EXEC_OPTS });
+      await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000, ...EXEC_OPTS });
       const found = findCachedFile(videoId);
       if (found) {
         logger.info({ videoId, client, attempt }, "download ok");
@@ -268,16 +345,28 @@ async function _doDownload(videoId: string): Promise<string> {
     } catch (err) {
       lastErr = String((err as { stderr?: string }).stderr ?? err).slice(0, 300);
       logger.warn({ videoId, client, attempt, lastErr }, "download attempt failed");
-      if (/Sign in|confirm you|bot/i.test(lastErr) && !COOKIE_PATH) {
-        throw new Error("❌ يوتيوب يطلب تسجيل دخول — أضف YOUTUBE_COOKIES");
+      if (/Sign in|confirm you|bot|cookies/i.test(lastErr)) {
+        if (!COOKIE_PATH) {
+          throw new Error(
+            "❌ يوتيوب يطلب تسجيل دخول\n\n" +
+            "الحل: أرسل */cookies* لتعرف كيف تضيف كوكيز من متصفحك"
+          );
+        }
       }
       if (/unavailable|private|removed|age/i.test(lastErr)) {
         throw new Error("❌ الفيديو غير متاح أو خاص أو مقيد عمرياً");
       }
+      if (/403|Forbidden/i.test(lastErr) && attempt < PLAYER_CLIENT_FALLBACKS.length - 1) {
+        logger.info({ videoId, client }, "403 — trying next client");
+        continue;
+      }
     }
   }
 
-  throw new Error(`❌ فشل التحميل بعد ${PLAYER_CLIENT_FALLBACKS.length} محاولات — ${lastErr.slice(0, 150)}`);
+  const hint = COOKIE_PATH
+    ? ""
+    : "\n\n💡 *الحل الدائم:* أضف */cookies* لمعرفة كيفية إضافة كوكيز YouTube";
+  throw new Error(`❌ فشل التحميل بعد ${PLAYER_CLIENT_FALLBACKS.length} محاولات — ${lastErr.slice(0, 120)}${hint}`);
 }
 
 // ── Download an arbitrary Telegram file (for reply-to-audio voice play) ───
@@ -482,12 +571,20 @@ bot.command("start", ctx => ctx.reply(
 // ── /status ───────────────────────────────────────────────────────────────
 bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
-  const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة (أضف YOUTUBE_COOKIES)";
+  const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة — /cookies للمساعدة";
+  const apiStatus = YOUTUBE_API_KEY ? "✅ مفعّل (بحث سريع)" : "❌ غير موجود — أضف GOOGLE_API_KEY";
   const vs = voiceManager.isReady()
     ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr").catch(() => "❌ خطأ")
     : "❌ لم تبدأ";
   await ctx.reply(
-    `*الحالة:*\nyt-dlp: \`${ytVer}\`\n🍪 كوكيز: ${cookieStatus}\n💾 كاش: ${fileIdCache.size} أغنية\n📁 مجلد: \`${DATA_DIR}\`\n🔍 بحث محفوظ: ${searchCache.size}\n📞 حساب: ${vs}`,
+    `*الحالة:*\n` +
+    `yt-dlp: \`${ytVer}\`\n` +
+    `🔑 YouTube API: ${apiStatus}\n` +
+    `🍪 كوكيز: ${cookieStatus}\n` +
+    `💾 كاش: ${fileIdCache.size} أغنية\n` +
+    `📁 مجلد: \`${DATA_DIR}\`\n` +
+    `🔍 بحث محفوظ: ${searchCache.size}\n` +
+    `📞 حساب صوتي: ${vs}`,
     { parse_mode: "Markdown" },
   );
 });
