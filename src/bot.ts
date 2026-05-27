@@ -293,15 +293,17 @@ function findCachedFile(videoId: string): string | null {
   return null;
 }
 
-// Download strategies: "auto" first (yt-dlp picks best client itself), then specific clients as fallbacks.
-// "auto" has the highest success rate because yt-dlp uses its own logic + honors cookies.
+// Download strategies.
+// android_vr is first — yt-dlp 2026 falls back to it when no JS runtime is found,
+// which is exactly what succeeds on server IPs. Also add --js-runtimes node so yt-dlp
+// can use the Node.js binary available on Railway for proper JS decoding.
 const DOWNLOAD_STRATEGIES: Array<{ label: string; clientArgs: string[] }> = [
+  { label: "android_vr",  clientArgs: ["--extractor-args", "youtube:player_client=android_vr"] },
   { label: "auto",        clientArgs: [] },
-  { label: "mweb",        clientArgs: ["--extractor-args", "youtube:player_client=mweb"] },
   { label: "tv_embedded", clientArgs: ["--extractor-args", "youtube:player_client=tv_embedded"] },
+  { label: "mweb",        clientArgs: ["--extractor-args", "youtube:player_client=mweb"] },
   { label: "ios",         clientArgs: ["--extractor-args", "youtube:player_client=ios"] },
   { label: "android",     clientArgs: ["--extractor-args", "youtube:player_client=android"] },
-  { label: "web",         clientArgs: ["--extractor-args", "youtube:player_client=web"] },
 ];
 
 async function _doDownload(videoId: string): Promise<string> {
@@ -327,8 +329,9 @@ async function _doDownload(videoId: string): Promise<string> {
       "--fragment-retries", "3",
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "-x",                      // use ffmpeg to extract audio — no format restriction needed
-      "--audio-format", "best",  // keep best native codec, no re-encode
+      "--js-runtimes", "node",   // use Node.js for YouTube JS decoding (required in yt-dlp 2026+)
+      "-x",                      // extract audio via ffmpeg
+      "--audio-format", "best",
       "--audio-quality", "0",
       ...clientArgs,
       "-o", outTemplate,
