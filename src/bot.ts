@@ -329,7 +329,7 @@ async function _doDownload(videoId: string): Promise<string> {
       "--extractor-args", `youtube:player_client=${client}`,
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "-f", "bestaudio[ext=m4a]/bestaudio[ext=opus]/bestaudio[ext=webm]/bestaudio/best",
+      "-f", "bestaudio/best",
       "-o", outTemplate,
       url,
     ];
