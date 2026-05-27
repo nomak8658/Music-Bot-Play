@@ -329,7 +329,6 @@ async function _doDownload(videoId: string): Promise<string> {
       "--fragment-retries", "3",
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "--js-runtimes", "node",   // use Node.js for YouTube JS decoding (required in yt-dlp 2026+)
       "-x",                      // extract audio via ffmpeg
       "--audio-format", "best",
       "--audio-quality", "0",
