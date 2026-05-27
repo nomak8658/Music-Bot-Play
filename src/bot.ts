@@ -431,7 +431,7 @@ async function _doDownload(videoId: string): Promise<string> {
   }
 
   throw new Error(
-    `❌ فشل التحميل بعد ${DOWNLOAD_STRATEGIES.length} محاولات\n` +
+    `❌ فشل التحميل بعد ${DOWNLOAD_STRATEGY_CLIENTS.length} محاولات\n` +
     `السبب: ${lastErr.slice(0, 200)}`
   );
 }
