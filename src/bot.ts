@@ -293,29 +293,28 @@ function findCachedFile(videoId: string): string | null {
   return null;
 }
 
-// Player clients tried in order — mweb & tv_embedded bypass most 403s without cookies.
-const PLAYER_CLIENT_FALLBACKS = [
-  "mweb",
-  "tv_embedded",
-  "ios",
-  "android",
-  "web",
+// Download strategies: "auto" first (yt-dlp picks best client itself), then specific clients as fallbacks.
+// "auto" has the highest success rate because yt-dlp uses its own logic + honors cookies.
+const DOWNLOAD_STRATEGIES: Array<{ label: string; clientArgs: string[] }> = [
+  { label: "auto",        clientArgs: [] },
+  { label: "mweb",        clientArgs: ["--extractor-args", "youtube:player_client=mweb"] },
+  { label: "tv_embedded", clientArgs: ["--extractor-args", "youtube:player_client=tv_embedded"] },
+  { label: "ios",         clientArgs: ["--extractor-args", "youtube:player_client=ios"] },
+  { label: "android",     clientArgs: ["--extractor-args", "youtube:player_client=android"] },
+  { label: "web",         clientArgs: ["--extractor-args", "youtube:player_client=web"] },
 ];
 
 async function _doDownload(videoId: string): Promise<string> {
   const cached = findCachedFile(videoId);
-  if (cached) {
-    logger.info({ videoId }, "cache hit");
-    return cached;
-  }
+  if (cached) { logger.info({ videoId }, "cache hit"); return cached; }
 
   const cacheDir = tmpdir();
   const outTemplate = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   let lastErr = "";
-  for (let attempt = 0; attempt < PLAYER_CLIENT_FALLBACKS.length; attempt++) {
-    const client = PLAYER_CLIENT_FALLBACKS[attempt]!;
+
+  for (const { label, clientArgs } of DOWNLOAD_STRATEGIES) {
     const args: string[] = [
       ...cookieArgs(),
       "--no-playlist",
@@ -324,15 +323,14 @@ async function _doDownload(videoId: string): Promise<string> {
       "--no-mtime",
       "--no-part",
       "--socket-timeout", "30",
-      "--retries", "3",
-      "--fragment-retries", "5",
-      "--concurrent-fragments", "4",
-      "--extractor-args", `youtube:player_client=${client}`,
+      "--retries", "2",
+      "--fragment-retries", "3",
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "-x",                     // extract audio via ffmpeg — works with ANY format
-      "--audio-format", "best", // keep original codec, no re-encode
-      "--audio-quality", "0",   // best quality
+      "-x",                      // use ffmpeg to extract audio — no format restriction needed
+      "--audio-format", "best",  // keep best native codec, no re-encode
+      "--audio-quality", "0",
+      ...clientArgs,
       "-o", outTemplate,
       url,
     ];
@@ -340,36 +338,35 @@ async function _doDownload(videoId: string): Promise<string> {
     try {
       await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000, ...EXEC_OPTS });
       const found = findCachedFile(videoId);
-      if (found) {
-        logger.info({ videoId, client, attempt }, "download ok");
-        return found;
-      }
+      if (found) { logger.info({ videoId, label }, "download ok"); return found; }
       lastErr = "file not produced";
     } catch (err) {
-      lastErr = String((err as { stderr?: string }).stderr ?? err).slice(0, 300);
-      logger.warn({ videoId, client, attempt, lastErr }, "download attempt failed");
-      if (/Sign in|confirm you|bot|cookies/i.test(lastErr)) {
-        if (!COOKIE_PATH) {
-          throw new Error(
-            "❌ يوتيوب يطلب تسجيل دخول\n\n" +
-            "الحل: أرسل */cookies* لتعرف كيف تضيف كوكيز من متصفحك"
-          );
-        }
+      lastErr = String((err as { stderr?: string }).stderr ?? err).slice(0, 400);
+      logger.warn({ videoId, label, err: lastErr.slice(0, 150) }, "attempt failed");
+
+      // Fatal errors — no point retrying
+      if (/unavailable|private|removed|This video is not available/i.test(lastErr)) {
+        throw new Error("❌ الفيديو غير متاح أو خاص أو محذوف");
       }
-      if (/unavailable|private|removed|age/i.test(lastErr)) {
-        throw new Error("❌ الفيديو غير متاح أو خاص أو مقيد عمرياً");
+      if (/age.restrict|Sign in to confirm your age/i.test(lastErr)) {
+        throw new Error("❌ الفيديو مقيد عمرياً — الكوكيز لازم تكون من حساب مسجّل");
       }
-      if (/403|Forbidden/i.test(lastErr) && attempt < PLAYER_CLIENT_FALLBACKS.length - 1) {
-        logger.info({ videoId, client }, "403 — trying next client");
-        continue;
+      if (/copyright|not available in your country/i.test(lastErr)) {
+        throw new Error("❌ الفيديو محجوب في منطقة السيرفر بسبب حقوق النشر");
       }
+      if ((/Sign in|confirm you're not a bot/i.test(lastErr)) && !COOKIE_PATH) {
+        throw new Error("❌ يوتيوب يطلب تسجيل دخول — أرسل /cookies");
+      }
+
+      // Transient errors — continue to next strategy
+      logger.info({ videoId, label }, "retrying with next strategy...");
     }
   }
 
-  const hint = COOKIE_PATH
-    ? ""
-    : "\n\n💡 *الحل الدائم:* أضف */cookies* لمعرفة كيفية إضافة كوكيز YouTube";
-  throw new Error(`❌ فشل التحميل بعد ${PLAYER_CLIENT_FALLBACKS.length} محاولات — ${lastErr.slice(0, 120)}${hint}`);
+  throw new Error(
+    `❌ فشل التحميل بعد ${DOWNLOAD_STRATEGIES.length} محاولات\n` +
+    `السبب: ${lastErr.slice(0, 200)}`
+  );
 }
 
 // ── Download an arbitrary Telegram file (for reply-to-audio voice play) ───
