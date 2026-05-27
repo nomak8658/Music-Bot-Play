@@ -2,7 +2,7 @@ import { Bot, InlineKeyboard, InputFile, InlineQueryResultBuilder } from "grammy
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { unlink, readFile, writeFile, stat, mkdir } from "node:fs/promises";
-import { existsSync, createReadStream, writeFileSync, createWriteStream } from "node:fs";
+import { existsSync, createReadStream, writeFileSync, createWriteStream, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -56,12 +56,22 @@ function setupCookies(): string | null {
   const raw = process.env["YOUTUBE_COOKIES"];
   const b64 = process.env["YOUTUBE_COOKIES_B64"];
   try {
-    if (raw && raw.trim().length > 10) {
-      writeFileSync(COOKIE_FILE, raw);
+    if (b64 && b64.trim().length > 10) {
+      // base64 is the most reliable format — no newline escaping issues
+      const content = Buffer.from(b64.trim(), "base64").toString("utf8");
+      writeFileSync(COOKIE_FILE, content);
+      logger.info({ lines: content.split("\n").length }, "cookies loaded from YOUTUBE_COOKIES_B64");
       return COOKIE_FILE;
     }
-    if (b64 && b64.trim().length > 10) {
-      writeFileSync(COOKIE_FILE, Buffer.from(b64, "base64").toString());
+    if (raw && raw.trim().length > 10) {
+      // Railway / many env systems store newlines as literal \n — fix that
+      const content = raw.replace(/\\n/g, "\n");
+      writeFileSync(COOKIE_FILE, content);
+      const lines = content.split("\n").filter(l => l.trim() && !l.startsWith("#")).length;
+      logger.info({ lines }, "cookies loaded from YOUTUBE_COOKIES");
+      if (lines === 0) {
+        logger.warn("YOUTUBE_COOKIES parsed to 0 cookie lines — file may be malformed");
+      }
       return COOKIE_FILE;
     }
   } catch (err) { logger.error({ err }, "Failed to write cookies"); }
@@ -589,6 +599,36 @@ bot.command("start", ctx => ctx.reply(
   "🔎 `@البوت اسم_الأغنية` في أي محادثة",
   { parse_mode: "Markdown" },
 ));
+
+// ── /cookies-check ────────────────────────────────────────────────────────
+bot.command("cookies_check", async ctx => {
+  if (!COOKIE_PATH) {
+    await ctx.reply("❌ لا توجد كوكيز مضبوطة — أضف YOUTUBE_COOKIES أو YOUTUBE_COOKIES_B64 على Railway");
+    return;
+  }
+  try {
+    const content = readFileSync(COOKIE_PATH, "utf8");
+    const allLines = content.split("\n");
+    const cookieLines = allLines.filter(l => l.trim() && !l.startsWith("#"));
+    const hasDomain = cookieLines.some(l => l.includes(".youtube.com") || l.includes("youtube.com"));
+    const hasLoginCookie = cookieLines.some(l => l.includes("SAPISID") || l.includes("SID") || l.includes("__Secure-1PSID"));
+    await ctx.reply(
+      `*تشخيص الكوكيز:*\n` +
+      `📄 إجمالي الأسطر: ${allLines.length}\n` +
+      `🍪 أسطر الكوكيز: ${cookieLines.length}\n` +
+      `📺 يحتوي .youtube.com: ${hasDomain ? "✅" : "❌"}\n` +
+      `🔐 يحتوي كوكيز تسجيل دخول: ${hasLoginCookie ? "✅" : "❌ (لازم تكون مسجّل دخول على يوتيوب)"}\n\n` +
+      (cookieLines.length === 0
+        ? "⚠️ *الكوكيز فارغة!*\nالسبب الأغلب أن Railway حوّل الأسطر الجديدة لـ `\\n`. استخدم `YOUTUBE_COOKIES_B64` بدلاً من ذلك:\n`cat cookies.txt | base64 -w 0`"
+        : !hasLoginCookie
+        ? "⚠️ *كوكيز بدون تسجيل دخول*\nصدّر الكوكيز من متصفح وأنت مسجّل دخول على يوتيوب"
+        : "✅ الكوكيز تبدو صحيحة"),
+      { parse_mode: "Markdown" },
+    );
+  } catch (e) {
+    await ctx.reply(`❌ خطأ في قراءة ملف الكوكيز: ${String(e)}`);
+  }
+});
 
 // ── /status ───────────────────────────────────────────────────────────────
 bot.command("status", async ctx => {
