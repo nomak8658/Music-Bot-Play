@@ -75,6 +75,15 @@ function cookieArgs(): string[] {
   return COOKIE_PATH ? ["--cookies", COOKIE_PATH] : [];
 }
 
+// ── Proxy support (set PROXY_URL on Railway to bypass CDN blocks) ──────────
+const PROXY_URL = process.env["PROXY_URL"] ?? "";
+if (PROXY_URL) logger.info("Proxy configured ✓");
+else logger.warn("No PROXY_URL set — Railway IP may be blocked by YouTube CDN");
+
+function proxyArgs(): string[] {
+  return PROXY_URL ? ["--proxy", PROXY_URL] : [];
+}
+
 // ── File-ID cache (Telegram file_id → instant resend) ─────────────────────
 const CACHE_FILE = join(DATA_DIR, "cache.json");
 const fileIdCache = new Map<string, { fileId: string; title: string; uploader: string; duration: string }>();
@@ -225,8 +234,9 @@ async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResul
     "--no-check-certificates",
     "--socket-timeout", "15",
     "--no-warnings",
-    "--extractor-args", "youtube:player_client=mweb,tv_embedded",
+    "--extractor-args", "youtube:player_client=android_vr,mweb",
     ...cookieArgs(),
+    ...proxyArgs(),
   ];
   let stdout = "";
   try {
@@ -255,9 +265,18 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   const cached = searchCache.get(key);
   if (cached && Date.now() - cached.at < SEARCH_TTL_MS) return cached.results;
 
-  let results: VideoResult[];
+  let results: VideoResult[] = [];
   if (YOUTUBE_API_KEY) {
-    results = await searchLimit(() => _searchViaYouTubeAPI(query, limit));
+    try {
+      results = await searchLimit(() => _searchViaYouTubeAPI(query, limit));
+    } catch (err) {
+      logger.warn({ err }, "YouTube API search failed — falling back to yt-dlp");
+    }
+    // fall back if API returned nothing (quota, no results, etc.)
+    if (!results.length) {
+      logger.info({ query }, "YouTube API returned empty — using yt-dlp fallback");
+      results = await searchLimit(() => _searchViaYtDlp(query, limit));
+    }
   } else {
     results = await searchLimit(() => _searchViaYtDlp(query, limit));
   }
@@ -329,6 +348,7 @@ async function _doDownload(videoId: string): Promise<string> {
       "--fragment-retries", "3",
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
+      ...proxyArgs(),
       "-x",                      // extract audio via ffmpeg
       "--audio-format", "best",
       "--audio-quality", "0",
@@ -575,6 +595,7 @@ bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
   const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة — /cookies للمساعدة";
   const apiStatus = YOUTUBE_API_KEY ? "✅ مفعّل (بحث سريع)" : "❌ غير موجود — أضف GOOGLE_API_KEY";
+  const proxyStatus = PROXY_URL ? `✅ ${PROXY_URL.replace(/\/\/.*@/, "//***@")}` : "❌ غير مفعّل — أضف PROXY_URL لحل مشكلة 403";
   const vs = voiceManager.isReady()
     ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr").catch(() => "❌ خطأ")
     : "❌ لم تبدأ";
@@ -583,6 +604,7 @@ bot.command("status", async ctx => {
     `yt-dlp: \`${ytVer}\`\n` +
     `🔑 YouTube API: ${apiStatus}\n` +
     `🍪 كوكيز: ${cookieStatus}\n` +
+    `🌐 بروكسي: ${proxyStatus}\n` +
     `💾 كاش: ${fileIdCache.size} أغنية\n` +
     `📁 مجلد: \`${DATA_DIR}\`\n` +
     `🔍 بحث محفوظ: ${searchCache.size}\n` +
