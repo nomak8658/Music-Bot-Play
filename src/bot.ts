@@ -112,10 +112,7 @@ function cookieArgs(): string[] {
   return COOKIE_PATH ? ["--cookies", COOKIE_PATH] : [];
 }
 
-// ── Proxy support (set PROXY_URL on Railway to bypass CDN blocks) ──────────
 const PROXY_URL = process.env["PROXY_URL"] ?? "";
-if (PROXY_URL) logger.info("Proxy configured ✓");
-else logger.warn("No PROXY_URL set — Railway IP may be blocked by YouTube CDN");
 
 function proxyArgs(): string[] {
   return PROXY_URL ? ["--proxy", PROXY_URL] : [];
@@ -156,7 +153,7 @@ function scheduleCacheSave() {
 }
 
 // ── Search-result cache (5 min) ───────────────────────────────────────────
-type VideoResult = { id: string; title: string; duration: string; durationSec: number; uploader: string; thumbnail: string };
+type VideoResult = { id: string; title: string; duration: string; durationSec: number; uploader: string; thumbnail: string; url?: string };
 type QueueItem = { videoId: string; title: string; uploader: string; requesterId: number; localFile?: string };
 
 const searchCache = new Map<string, { at: number; results: VideoResult[] }>();
@@ -202,78 +199,15 @@ function createLimiter(maxConcurrent: number) {
 const searchLimit = createLimiter(8);
 const downloadLimit = createLimiter(4);
 
-// ── Search via YouTube Data API v3 ─────────────────────────────────────────
-const YOUTUBE_API_KEY = process.env["GOOGLE_API_KEY"] ?? process.env["YOUTUBE_API_KEY"] ?? "";
-if (YOUTUBE_API_KEY) logger.info("YouTube Data API v3 key loaded ✓");
-else logger.warn("GOOGLE_API_KEY not set — falling back to yt-dlp search");
-
-async function _searchViaYouTubeAPI(query: string, limit: number): Promise<VideoResult[]> {
-  // Step 1: search
-  const searchUrl =
-    `https://www.googleapis.com/youtube/v3/search?part=snippet` +
-    `&q=${encodeURIComponent(query)}&type=video&maxResults=${limit}` +
-    `&key=${YOUTUBE_API_KEY}`;
-  const searchRes = await fetch(searchUrl, { signal: AbortSignal.timeout(15_000) });
-  if (!searchRes.ok) {
-    const body = await searchRes.text().catch(() => "");
-    throw new Error(`YouTube API ${searchRes.status}: ${body.slice(0, 200)}`);
-  }
-  const searchData = await searchRes.json() as {
-    items?: Array<{
-      id: { videoId: string };
-      snippet: {
-        title: string;
-        channelTitle: string;
-        thumbnails: { default?: { url: string }; medium?: { url: string } };
-      };
-    }>;
-    error?: { message: string };
-  };
-  if (searchData.error) throw new Error(`YouTube API: ${searchData.error.message}`);
-  // Filter: only keep items that actually have a videoId (API sometimes returns channels/playlists)
-  const items = (searchData.items ?? []).filter(i => !!i.id.videoId);
-  if (!items.length) return [];
-
-  // Step 2: fetch durations in one batch
-  const ids = items.map(i => i.id.videoId).join(",");
-  const detailsUrl =
-    `https://www.googleapis.com/youtube/v3/videos?part=contentDetails` +
-    `&id=${ids}&key=${YOUTUBE_API_KEY}`;
-  const detailsRes = await fetch(detailsUrl, { signal: AbortSignal.timeout(10_000) });
-  const durationMap = new Map<string, number>();
-  if (detailsRes.ok) {
-    const dd = await detailsRes.json() as {
-      items?: Array<{ id: string; contentDetails: { duration: string } }>;
-    };
-    for (const v of dd.items ?? []) durationMap.set(v.id, parseDuration(v.contentDetails.duration));
-  }
-
-  return items.map(item => {
-    const videoId = item.id.videoId;
-    const durSec = durationMap.get(videoId) ?? 0;
-    const thumb = item.snippet.thumbnails.medium?.url ?? item.snippet.thumbnails.default?.url ?? "";
-    return {
-      id: videoId,
-      title: item.snippet.title,
-      duration: fmtDuration(durSec),
-      durationSec: durSec,
-      uploader: item.snippet.channelTitle,
-      thumbnail: thumb,
-    };
-  });
-}
-
-// ── Search via yt-dlp (fallback) ───────────────────────────────────────────
-async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResult[]> {
+// ── Search via SoundCloud (via yt-dlp scsearch) ───────────────────────────
+// SoundCloud works reliably from datacenter IPs — no bot detection issues.
+async function searchSoundCloud(query: string, limit: number): Promise<VideoResult[]> {
   const args = [
-    `ytsearch${limit}:${query}`,
+    `scsearch${limit}:${query}`,
     "-J", "--flat-playlist",
     "--no-check-certificates",
     "--socket-timeout", "15",
     "--no-warnings",
-    ...visitorArgs("android_vr"),
-    ...cookieArgs(),
-    ...proxyArgs(),
   ];
   let stdout = "";
   try {
@@ -285,7 +219,7 @@ async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResul
     else throw new Error(((e.stderr ?? "") + "").slice(0, 400) || "البحث فشل");
   }
   const playlist = JSON.parse(stdout) as {
-    entries?: Array<{ id?: string; title?: string; duration?: number; uploader?: string; channel?: string; thumbnail?: string; thumbnails?: Array<{ url: string }>; }>;
+    entries?: Array<{ id?: string; title?: string; duration?: number; uploader?: string; channel?: string; thumbnail?: string; thumbnails?: Array<{ url: string }>; webpage_url?: string; }>;
   };
   return (playlist.entries ?? []).filter(e => e.id).map(e => ({
     id: e.id!,
@@ -294,6 +228,7 @@ async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResul
     durationSec: e.duration ?? 0,
     uploader: e.uploader ?? e.channel ?? "Unknown",
     thumbnail: e.thumbnail ?? e.thumbnails?.[0]?.url ?? "",
+    url: e.webpage_url,
   }));
 }
 
@@ -302,21 +237,7 @@ async function searchYouTube(query: string, limit = 5): Promise<VideoResult[]> {
   const cached = searchCache.get(key);
   if (cached && Date.now() - cached.at < SEARCH_TTL_MS) return cached.results;
 
-  let results: VideoResult[] = [];
-  if (YOUTUBE_API_KEY) {
-    try {
-      results = await searchLimit(() => _searchViaYouTubeAPI(query, limit));
-    } catch (err) {
-      logger.warn({ err }, "YouTube API search failed — falling back to yt-dlp");
-    }
-    // fall back if API returned nothing (quota, no results, etc.)
-    if (!results.length) {
-      logger.info({ query }, "YouTube API returned empty — using yt-dlp fallback");
-      results = await searchLimit(() => _searchViaYtDlp(query, limit));
-    }
-  } else {
-    results = await searchLimit(() => _searchViaYtDlp(query, limit));
-  }
+  const results = await searchLimit(() => searchSoundCloud(query, limit));
 
   searchCache.set(key, { at: Date.now(), results });
   if (searchCache.size > 500) {
@@ -349,91 +270,42 @@ function findCachedFile(videoId: string): string | null {
   return null;
 }
 
-// Download strategies.
-// visitor_data is injected dynamically at call time — see visitorArgs() below.
-// noCookies: android_vr works WITHOUT cookies. Passing cookies from a different IP
-// triggers YouTube's "sign in to confirm" bot check on datacenter IPs.
-const DOWNLOAD_STRATEGY_CLIENTS = [
-  { label: "android_vr",  client: "android_vr", noCookies: true },
-  { label: "android_vr+cookies", client: "android_vr", noCookies: false },
-  { label: "auto",        client: "",            noCookies: false },
-  { label: "tv_embedded", client: "tv_embedded", noCookies: false },
-  { label: "ios",         client: "ios",         noCookies: false },
-  { label: "android",     client: "android",     noCookies: false },
-] as const;
-
-function visitorArgs(client: string): string[] {
-  if (!VISITOR_DATA) return client ? ["--extractor-args", `youtube:player_client=${client}`] : [];
-  const spec = client
-    ? `youtube:player_client=${client},visitor_data=${VISITOR_DATA}`
-    : `youtube:visitor_data=${VISITOR_DATA}`;
-  return ["--extractor-args", spec];
-}
-
+// SoundCloud download — direct URL from search result or scsearch fallback
 async function _doDownload(videoId: string): Promise<string> {
   const cached = findCachedFile(videoId);
   if (cached) { logger.info({ videoId }, "cache hit"); return cached; }
 
   const cacheDir = tmpdir();
   const outTemplate = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  let lastErr = "";
+  // videoId may be a numeric SoundCloud ID or a full URL
+  const url = videoId.startsWith("http") ? videoId : `https://soundcloud.com/tracks/${videoId}`;
 
-  for (const { label, client, noCookies } of DOWNLOAD_STRATEGY_CLIENTS) {
-    const args: string[] = [
-      ...(noCookies ? [] : cookieArgs()),
-      "--no-playlist",
-      "--no-warnings",
-      "--no-check-certificates",
-      "--no-mtime",
-      "--no-part",
-      "--socket-timeout", "30",
-      "--retries", "2",
-      "--fragment-retries", "3",
-      "--add-header", "Accept-Language:en-US,en;q=0.9",
-      "--geo-bypass",
-      ...proxyArgs(),
-      "-x",
-      "--audio-format", "best",
-      "--audio-quality", "0",
-      ...visitorArgs(client),
-      "-o", outTemplate,
-      url,
-    ];
+  const args: string[] = [
+    "--no-playlist",
+    "--no-warnings",
+    "--no-check-certificates",
+    "--no-mtime",
+    "--no-part",
+    "--socket-timeout", "30",
+    "--retries", "3",
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "-o", outTemplate,
+    url,
+  ];
 
-    try {
-      await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000, ...EXEC_OPTS });
-      const found = findCachedFile(videoId);
-      if (found) { logger.info({ videoId, label }, "download ok"); return found; }
-      lastErr = "file not produced";
-    } catch (err) {
-      lastErr = String((err as { stderr?: string }).stderr ?? err).slice(0, 400);
-      logger.warn({ videoId, label, err: lastErr.slice(0, 150) }, "attempt failed");
-
-      // Fatal errors — no point retrying
-      if (/unavailable|private|removed|This video is not available/i.test(lastErr)) {
-        throw new Error("❌ الفيديو غير متاح أو خاص أو محذوف");
-      }
-      if (/age.restrict|Sign in to confirm your age/i.test(lastErr)) {
-        throw new Error("❌ الفيديو مقيد عمرياً — الكوكيز لازم تكون من حساب مسجّل");
-      }
-      if (/copyright|not available in your country/i.test(lastErr)) {
-        throw new Error("❌ الفيديو محجوب في منطقة السيرفر بسبب حقوق النشر");
-      }
-      if ((/Sign in|confirm you're not a bot/i.test(lastErr)) && !COOKIE_PATH) {
-        throw new Error("❌ يوتيوب يطلب تسجيل دخول — أرسل /cookies");
-      }
-
-      // Transient errors — continue to next strategy
-      logger.info({ videoId, label }, "retrying with next strategy...");
-    }
+  try {
+    await execFileAsync(YT_DLP_BIN, args, { timeout: 120_000, ...EXEC_OPTS });
+    const found = findCachedFile(videoId);
+    if (found) { logger.info({ videoId }, "soundcloud download ok"); return found; }
+    throw new Error("file not produced");
+  } catch (err) {
+    const msg = String((err as { stderr?: string }).stderr ?? err).slice(0, 400);
+    logger.error({ videoId, err: msg.slice(0, 150) }, "soundcloud download failed");
+    throw new Error(`❌ فشل التحميل\nالسبب: ${msg.slice(0, 200)}`);
   }
-
-  throw new Error(
-    `❌ فشل التحميل بعد ${DOWNLOAD_STRATEGY_CLIENTS.length} محاولات\n` +
-    `السبب: ${lastErr.slice(0, 200)}`
-  );
 }
 
 // ── Download an arbitrary Telegram file (for reply-to-audio voice play) ───
@@ -668,20 +540,13 @@ bot.command("cookies_check", async ctx => {
 // ── /status ───────────────────────────────────────────────────────────────
 bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
-  const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة — /cookies للمساعدة";
-  const apiStatus = YOUTUBE_API_KEY ? "✅ مفعّل (بحث سريع)" : "❌ غير موجود — أضف GOOGLE_API_KEY";
-  const proxyStatus = PROXY_URL ? `✅ ${PROXY_URL.replace(/\/\/.*@/, "//***@")}` : "❌ غير مفعّل";
-  const visitorStatus = VISITOR_DATA ? `✅ ${VISITOR_DATA.slice(0, 12)}…` : "⏳ جارٍ الجلب...";
   const vs = voiceManager.isReady()
     ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr").catch(() => "❌ خطأ")
     : "❌ لم تبدأ";
   await ctx.reply(
     `*الحالة:*\n` +
     `yt-dlp: \`${ytVer}\`\n` +
-    `🔑 YouTube API: ${apiStatus}\n` +
-    `🍪 كوكيز: ${cookieStatus}\n` +
-    `🌐 بروكسي: ${proxyStatus}\n` +
-    `🔓 visitor_data: ${visitorStatus}\n` +
+    `🎵 مصدر الموسيقى: SoundCloud ✅\n` +
     `💾 كاش: ${fileIdCache.size} أغنية\n` +
     `📁 مجلد: \`${DATA_DIR}\`\n` +
     `🔍 بحث محفوظ: ${searchCache.size}\n` +
