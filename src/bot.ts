@@ -222,7 +222,8 @@ async function searchSoundCloud(query: string, limit: number): Promise<VideoResu
     entries?: Array<{ id?: string; title?: string; duration?: number; uploader?: string; channel?: string; thumbnail?: string; thumbnails?: Array<{ url: string }>; webpage_url?: string; }>;
   };
   return (playlist.entries ?? []).filter(e => e.id).map(e => ({
-    id: e.id!,
+    // Use webpage_url as id so download gets the real URL directly
+    id: e.webpage_url ?? e.id!,
     title: e.title ?? "Unknown",
     duration: fmtDuration(e.duration ?? 0),
     durationSec: e.duration ?? 0,
@@ -270,16 +271,21 @@ function findCachedFile(videoId: string): string | null {
   return null;
 }
 
-// SoundCloud download — direct URL from search result or scsearch fallback
+// SoundCloud download — direct URL from search result
 async function _doDownload(videoId: string): Promise<string> {
-  const cached = findCachedFile(videoId);
-  if (cached) { logger.info({ videoId }, "cache hit"); return cached; }
+  // Create a safe cache key from the URL (or numeric ID)
+  const cacheKey = videoId.startsWith("http")
+    ? videoId.replace(/https?:\/\/[^/]+\//, "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)
+    : videoId;
+
+  const cached = findCachedFile(cacheKey);
+  if (cached) { logger.info({ cacheKey }, "cache hit"); return cached; }
 
   const cacheDir = tmpdir();
-  const outTemplate = join(cacheDir, `tgbot_${videoId}.%(ext)s`);
+  const outTemplate = join(cacheDir, `tgbot_${cacheKey}.%(ext)s`);
 
-  // videoId may be a numeric SoundCloud ID or a full URL
-  const url = videoId.startsWith("http") ? videoId : `https://soundcloud.com/tracks/${videoId}`;
+  // videoId is the full SoundCloud URL (webpage_url from search)
+  const url = videoId.startsWith("http") ? videoId : `scsearch1:${videoId}`;
 
   const args: string[] = [
     "--no-playlist",
