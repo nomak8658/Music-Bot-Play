@@ -50,6 +50,33 @@ try {
   logger.info({ bin: YT_DLP_BIN, ver }, "yt-dlp ready");
 } catch (err) { logger.error({ err }, "yt-dlp NOT found"); }
 
+// ── YouTube visitor_data (bypasses datacenter IP bot-detection) ───────────
+// Fetched from YouTube homepage at startup and refreshed every 2h.
+// Passing visitor_data via extractor-args lets yt-dlp work from Railway/VPS
+// without cookies or residential proxies.
+let VISITOR_DATA = "";
+async function fetchVisitorData(): Promise<void> {
+  try {
+    const res = await fetch("https://www.youtube.com/", {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const html = await res.text();
+    const m = html.match(/"visitorData":"([^"]+)"/);
+    if (m?.[1]) {
+      VISITOR_DATA = m[1];
+      logger.info({ visitorData: VISITOR_DATA.slice(0, 20) + "…" }, "visitor_data refreshed ✓");
+    } else {
+      logger.warn("visitor_data not found in YouTube homepage");
+    }
+  } catch (err) {
+    logger.warn({ err }, "Failed to fetch visitor_data — will retry next cycle");
+  }
+}
+// Fetch at startup, then refresh every 2 hours
+fetchVisitorData();
+setInterval(fetchVisitorData, 2 * 60 * 60 * 1000);
+
 // ── Cookies: write once to disk from env var ──────────────────────────────
 const COOKIE_FILE = join(tmpdir(), "yt_cookies.txt");
 function setupCookies(): string | null {
@@ -244,7 +271,7 @@ async function _searchViaYtDlp(query: string, limit: number): Promise<VideoResul
     "--no-check-certificates",
     "--socket-timeout", "15",
     "--no-warnings",
-    "--extractor-args", "youtube:player_client=android_vr,mweb",
+    ...visitorArgs("android_vr"),
     ...cookieArgs(),
     ...proxyArgs(),
   ];
@@ -323,17 +350,25 @@ function findCachedFile(videoId: string): string | null {
 }
 
 // Download strategies.
-// noCookies: android_vr works WITHOUT cookies — passing cookies from a different IP
-// actually triggers YouTube's "sign in to confirm" bot check. All other clients
-// use cookies normally.
-const DOWNLOAD_STRATEGIES: Array<{ label: string; clientArgs: string[]; noCookies?: boolean }> = [
-  { label: "android_vr",  clientArgs: ["--extractor-args", "youtube:player_client=android_vr"], noCookies: true },
-  { label: "android_vr+cookies", clientArgs: ["--extractor-args", "youtube:player_client=android_vr"] },
-  { label: "auto",        clientArgs: [] },
-  { label: "tv_embedded", clientArgs: ["--extractor-args", "youtube:player_client=tv_embedded"] },
-  { label: "ios",         clientArgs: ["--extractor-args", "youtube:player_client=ios"] },
-  { label: "android",     clientArgs: ["--extractor-args", "youtube:player_client=android"] },
-];
+// visitor_data is injected dynamically at call time — see visitorArgs() below.
+// noCookies: android_vr works WITHOUT cookies. Passing cookies from a different IP
+// triggers YouTube's "sign in to confirm" bot check on datacenter IPs.
+const DOWNLOAD_STRATEGY_CLIENTS = [
+  { label: "android_vr",  client: "android_vr", noCookies: true },
+  { label: "android_vr+cookies", client: "android_vr", noCookies: false },
+  { label: "auto",        client: "",            noCookies: false },
+  { label: "tv_embedded", client: "tv_embedded", noCookies: false },
+  { label: "ios",         client: "ios",         noCookies: false },
+  { label: "android",     client: "android",     noCookies: false },
+] as const;
+
+function visitorArgs(client: string): string[] {
+  if (!VISITOR_DATA) return client ? ["--extractor-args", `youtube:player_client=${client}`] : [];
+  const spec = client
+    ? `youtube:player_client=${client},visitor_data=${VISITOR_DATA}`
+    : `youtube:visitor_data=${VISITOR_DATA}`;
+  return ["--extractor-args", spec];
+}
 
 async function _doDownload(videoId: string): Promise<string> {
   const cached = findCachedFile(videoId);
@@ -345,7 +380,7 @@ async function _doDownload(videoId: string): Promise<string> {
 
   let lastErr = "";
 
-  for (const { label, clientArgs, noCookies } of DOWNLOAD_STRATEGIES) {
+  for (const { label, client, noCookies } of DOWNLOAD_STRATEGY_CLIENTS) {
     const args: string[] = [
       ...(noCookies ? [] : cookieArgs()),
       "--no-playlist",
@@ -359,10 +394,10 @@ async function _doDownload(videoId: string): Promise<string> {
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
       ...proxyArgs(),
-      "-x",                      // extract audio via ffmpeg
+      "-x",
       "--audio-format", "best",
       "--audio-quality", "0",
-      ...clientArgs,
+      ...visitorArgs(client),
       "-o", outTemplate,
       url,
     ];
@@ -635,7 +670,8 @@ bot.command("status", async ctx => {
   const ytVer = (() => { try { return execFileSync(YT_DLP_BIN, ["--version"], { stdio: "pipe" }).toString().trim(); } catch { return "❌ غير موجود"; } })();
   const cookieStatus = COOKIE_PATH ? "✅ محمّلة" : "❌ غير موجودة — /cookies للمساعدة";
   const apiStatus = YOUTUBE_API_KEY ? "✅ مفعّل (بحث سريع)" : "❌ غير موجود — أضف GOOGLE_API_KEY";
-  const proxyStatus = PROXY_URL ? `✅ ${PROXY_URL.replace(/\/\/.*@/, "//***@")}` : "❌ غير مفعّل — أضف PROXY_URL لحل مشكلة 403";
+  const proxyStatus = PROXY_URL ? `✅ ${PROXY_URL.replace(/\/\/.*@/, "//***@")}` : "❌ غير مفعّل";
+  const visitorStatus = VISITOR_DATA ? `✅ ${VISITOR_DATA.slice(0, 12)}…` : "⏳ جارٍ الجلب...";
   const vs = voiceManager.isReady()
     ? await voiceManager.checkSession().then(r => r.ok ? `✅ ${String(r.name)}` : "❌ لا يوجد حساب — /qr").catch(() => "❌ خطأ")
     : "❌ لم تبدأ";
@@ -645,6 +681,7 @@ bot.command("status", async ctx => {
     `🔑 YouTube API: ${apiStatus}\n` +
     `🍪 كوكيز: ${cookieStatus}\n` +
     `🌐 بروكسي: ${proxyStatus}\n` +
+    `🔓 visitor_data: ${visitorStatus}\n` +
     `💾 كاش: ${fileIdCache.size} أغنية\n` +
     `📁 مجلد: \`${DATA_DIR}\`\n` +
     `🔍 بحث محفوظ: ${searchCache.size}\n` +
