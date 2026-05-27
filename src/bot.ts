@@ -184,7 +184,8 @@ async function _searchViaYouTubeAPI(query: string, limit: number): Promise<Video
     error?: { message: string };
   };
   if (searchData.error) throw new Error(`YouTube API: ${searchData.error.message}`);
-  const items = searchData.items ?? [];
+  // Filter: only keep items that actually have a videoId (API sometimes returns channels/playlists)
+  const items = (searchData.items ?? []).filter(i => !!i.id.videoId);
   if (!items.length) return [];
 
   // Step 2: fetch durations in one batch
@@ -329,7 +330,9 @@ async function _doDownload(videoId: string): Promise<string> {
       "--extractor-args", `youtube:player_client=${client}`,
       "--add-header", "Accept-Language:en-US,en;q=0.9",
       "--geo-bypass",
-      "-f", "bestaudio/best",
+      "-x",                     // extract audio via ffmpeg — works with ANY format
+      "--audio-format", "best", // keep original codec, no re-encode
+      "--audio-quality", "0",   // best quality
       "-o", outTemplate,
       url,
     ];
