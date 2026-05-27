@@ -323,14 +323,14 @@ function findCachedFile(videoId: string): string | null {
 }
 
 // Download strategies.
-// android_vr is first — yt-dlp 2026 falls back to it when no JS runtime is found,
-// which is exactly what succeeds on server IPs. Also add --js-runtimes node so yt-dlp
-// can use the Node.js binary available on Railway for proper JS decoding.
-const DOWNLOAD_STRATEGIES: Array<{ label: string; clientArgs: string[] }> = [
-  { label: "android_vr",  clientArgs: ["--extractor-args", "youtube:player_client=android_vr"] },
+// noCookies: android_vr works WITHOUT cookies — passing cookies from a different IP
+// actually triggers YouTube's "sign in to confirm" bot check. All other clients
+// use cookies normally.
+const DOWNLOAD_STRATEGIES: Array<{ label: string; clientArgs: string[]; noCookies?: boolean }> = [
+  { label: "android_vr",  clientArgs: ["--extractor-args", "youtube:player_client=android_vr"], noCookies: true },
+  { label: "android_vr+cookies", clientArgs: ["--extractor-args", "youtube:player_client=android_vr"] },
   { label: "auto",        clientArgs: [] },
   { label: "tv_embedded", clientArgs: ["--extractor-args", "youtube:player_client=tv_embedded"] },
-  { label: "mweb",        clientArgs: ["--extractor-args", "youtube:player_client=mweb"] },
   { label: "ios",         clientArgs: ["--extractor-args", "youtube:player_client=ios"] },
   { label: "android",     clientArgs: ["--extractor-args", "youtube:player_client=android"] },
 ];
@@ -345,9 +345,9 @@ async function _doDownload(videoId: string): Promise<string> {
 
   let lastErr = "";
 
-  for (const { label, clientArgs } of DOWNLOAD_STRATEGIES) {
+  for (const { label, clientArgs, noCookies } of DOWNLOAD_STRATEGIES) {
     const args: string[] = [
-      ...cookieArgs(),
+      ...(noCookies ? [] : cookieArgs()),
       "--no-playlist",
       "--no-warnings",
       "--no-check-certificates",
